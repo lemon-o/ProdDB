@@ -81,9 +81,11 @@ class ImportProductThread(QThread):
 
     def run(self):
         updated_count = 0
+        skipped_count = 0
 
         try:
-            df = pd.read_excel(self.excel_path)
+            # 明确指定列名读取，跳过第一行标题
+            df = pd.read_excel(self.excel_path, header=0, names=["name", "_", "remark"])
         except Exception as e:
             print(f"读取Excel失败: {e}")
             self.finished.emit(0, 0)
@@ -92,25 +94,23 @@ class ImportProductThread(QThread):
         # 用 name 作为索引（self.folders_data 中已有）
         existing_items = {item.get("name", ""): item for item in self.folders_data}
 
-        # 跳过第一行标题，并筛选第一列非空的行
-        valid_rows = df.iloc[1:]
-        valid_rows = valid_rows[~valid_rows.iloc[:, 0].isna() & valid_rows.iloc[:, 0].astype(str).str.strip().ne("")]
-        total_rows = len(valid_rows)
+        # 获取A列非空数据（排除空值）
+        valid_rows = df[~df["name"].isna() & df["name"].astype(str).str.strip().ne("")]
+        total_names = len(valid_rows) # 有效name总数（已排除空值）
 
-        if total_rows == 0:
+        if total_names == 0:
             self.finished.emit(0, 0)
             return
 
         for i, (idx, row) in enumerate(valid_rows.iterrows()):
-            name = str(row.iloc[0]).strip()
-            product_info = str(row.iloc[1]).strip() if not pd.isna(row.iloc[1]) else ""
-            remark = str(row.iloc[2]).strip() if not pd.isna(row.iloc[2]) else ""
+            name = str(row["name"]).strip()
+            remark = str(row["remark"]).strip() if not pd.isna(row["remark"]) else ""
+
+            json_written = False  # 标记是否生成了 JSON
 
             if name in existing_items:
                 item = existing_items[name]
                 item["remark"] = remark
-                item["product_info"] = product_info
-                updated_count += 1
 
                 # 生成 JSON 文件到【已修】文件夹
                 folder_path = item.get("path", "")
@@ -124,20 +124,25 @@ class ImportProductThread(QThread):
                         json_data = {
                             "name": folder_name,
                             "remark": remark,
-                            "product_info": product_info
                         }
                         with open(json_file_path, "w", encoding="utf-8") as f:
                             json.dump(json_data, f, ensure_ascii=False, indent=2)
+                        json_written = True
                     except Exception as e:
                         print(f"生成JSON失败: {folder_path} -> {e}")
 
-            # 计算进度百分比
-            percent = int((i + 1) / total_rows * 100)
+            # 更新计数
+            if json_written:
+                updated_count += 1
+            else:
+                skipped_count += 1
+
+            # 更新进度
+            percent = int((i + 1) / total_names * 100)
             self.progress_changed.emit(percent, name)
 
-        skipped_count = total_rows - updated_count
+        # 完成时发射信号
         self.finished.emit(updated_count, skipped_count)
-
 # -------------------- 子线程 生成原图证明文件 --------------------
 class ZipGeneratorThread(QThread):
     """压缩包生成线程"""
@@ -1974,7 +1979,7 @@ class FolderDatabaseApp(QMainWindow):
         # 创建子线程
         self.import_thread = ImportProductThread(self.folders_data, file_path)
         self.import_thread.progress_changed.connect(
-            lambda percent, name: self.progress_dialog.setValue(percent) or self.progress_dialog.setLabelText(f"正在导入: {name}")
+            lambda percent, name: self.progress_dialog.setValue(percent) or self.progress_dialog.setLabelText(f"正在处理: {name}")
         )
         self.import_thread.finished.connect(self._on_import_finished)
         self.import_thread.start()
@@ -1986,8 +1991,10 @@ class FolderDatabaseApp(QMainWindow):
         self.save_database()
         self.folder_list.update()
         self.refresh_folder_list()
-
+        self.status_label.setText(f"导入完成")
         QMessageBox.information(self, "导入完成", f"导入完成！\n已更新数量：{updated_count}\n跳过数量：{skipped_count}")    
+        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
+
     #---------以上是菜单项逻辑------------------------------------------------
 
     def setup_hover_effects(self):
