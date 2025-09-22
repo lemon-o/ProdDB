@@ -4,17 +4,139 @@ import json
 import subprocess
 import platform
 import shutil
-import time
+import pandas as pd
 import zipfile
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
-                             QWidget, QPushButton, QLineEdit, QListWidget, QLabel, 
-                             QFileDialog, QMessageBox, QSplitter, QGroupBox, QListWidgetItem,
-                             QMenu, QAction, QProgressDialog, QAbstractItemView, QDialog, QTextEdit)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QPoint, QTimer
-from PyQt5.QtGui import QIcon, QPixmap, QPainter
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageFile
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
+
+
+class RoundMenu(QMenu):
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        # 设置无边框 + 透明背景
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        # 设置菜单基本样式（仅用于菜单项，不影响圆角背景）
+        self.setStyleSheet("""
+            QMenu {
+                background-color: white;  /* 背景色，会被paintEvent覆盖，但可以留着备用 */
+                border: none;
+                padding: 2px;
+            }
+            QMenu::item {
+                background-color: transparent;
+                padding: 8px 16px;
+                margin: 1px;
+                color: black;
+            }
+            QMenu::item:selected {
+                background-color: #e3f2fd;  /* 选中项背景色 */
+                color: black;
+            }
+            QMenu::item:disabled {
+                color: gray;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #cccccc;
+                margin: 4px 8px;
+            }
+        """)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 自定义背景颜色和圆角
+        bg_color = QColor(255, 255, 255)  # 白色背景，可换成其它颜色，如 #FFFFFF 或 QColor(240, 240, 240)
+        radius = 10  # 圆角半径，越大越圆，比如 8, 10, 12
+
+        # 绘制一个带圆角的矩形作为菜单背景
+        rect = self.rect()  # 菜单的整个矩形区域
+        painter.setBrush(bg_color)
+        painter.setPen(Qt.NoPen)  # 无边框线
+        painter.drawRoundedRect(rect, radius, radius)
+
+    def sizeHint(self):
+        # 可选：调整默认大小提示（根据需求）
+        sh = super().sizeHint()
+        return sh
+
+# ---------------- 子线程 导入产品信息----------------
+class ImportProductThread(QThread):
+    progress_changed = pyqtSignal(int, str)  # 百分比 + 当前处理的文件夹名
+    finished = pyqtSignal(int, int)          # 更新数量、跳过数量
+
+    def __init__(self, folders_data, excel_path):
+        super().__init__()
+        self.folders_data = folders_data
+        self.excel_path = excel_path
+
+    def run(self):
+        updated_count = 0
+
+        try:
+            df = pd.read_excel(self.excel_path)
+        except Exception as e:
+            print(f"读取Excel失败: {e}")
+            self.finished.emit(0, 0)
+            return
+
+        # 用 name 作为索引（self.folders_data 中已有）
+        existing_items = {item.get("name", ""): item for item in self.folders_data}
+
+        # 跳过第一行标题，并筛选第一列非空的行
+        valid_rows = df.iloc[1:]
+        valid_rows = valid_rows[~valid_rows.iloc[:, 0].isna() & valid_rows.iloc[:, 0].astype(str).str.strip().ne("")]
+        total_rows = len(valid_rows)
+
+        if total_rows == 0:
+            self.finished.emit(0, 0)
+            return
+
+        for i, (idx, row) in enumerate(valid_rows.iterrows()):
+            name = str(row.iloc[0]).strip()
+            product_info = str(row.iloc[1]).strip() if not pd.isna(row.iloc[1]) else ""
+            remark = str(row.iloc[2]).strip() if not pd.isna(row.iloc[2]) else ""
+
+            if name in existing_items:
+                item = existing_items[name]
+                item["remark"] = remark
+                item["product_info"] = product_info
+                updated_count += 1
+
+                # 生成 JSON 文件到【已修】文件夹
+                folder_path = item.get("path", "")
+                folder_name = item.get("name", "未知文件夹")
+                if folder_path:
+                    try:
+                        fixed_folder_path = os.path.join(folder_path, "已修")
+                        os.makedirs(fixed_folder_path, exist_ok=True)
+                        safe_name = "".join(c for c in folder_name if c not in "\\/:*?\"<>|")
+                        json_file_path = os.path.join(fixed_folder_path, f"{safe_name}_产品信息.json")
+                        json_data = {
+                            "name": folder_name,
+                            "remark": remark,
+                            "product_info": product_info
+                        }
+                        with open(json_file_path, "w", encoding="utf-8") as f:
+                            json.dump(json_data, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"生成JSON失败: {folder_path} -> {e}")
+
+            # 计算进度百分比
+            percent = int((i + 1) / total_rows * 100)
+            self.progress_changed.emit(percent, name)
+
+        skipped_count = total_rows - updated_count
+        self.finished.emit(updated_count, skipped_count)
 
 # -------------------- 子线程 生成原图证明文件 --------------------
 class ZipGeneratorThread(QThread):
@@ -272,10 +394,9 @@ class ZipGeneratorThread(QThread):
 
 # -------------------- 子线程 扫描文件夹 --------------------
 class FolderScanner(QThread):
-    folder_found = pyqtSignal(str, str, str)  # name, path, thumbnail_path
-    scan_finished = pyqtSignal(int, int)      # found_count, skipped_count
-    update_status = pyqtSignal(str)           # 实时状态
-
+    folder_found = pyqtSignal(str, str, str, str)  
+    scan_finished = pyqtSignal(int, int)      
+    update_status = pyqtSignal(str)          
     def __init__(self, root_path, search_term, added_paths=None):
         super().__init__()
         self.root_path = root_path
@@ -296,7 +417,7 @@ class FolderScanner(QThread):
                 if os.path.isdir(item_path):
                     # 实时更新状态
                     self.update_status.emit(
-                        f"扫描中：{item_path}\n已找到：{self.found_count} 个，已跳过：{self.skipped_count} 个"
+                        f"扫描中：{item_path}\n已写入：{self.found_count} 个，已跳过：{self.skipped_count} 个"
                     )
 
                     # 已添加路径跳过
@@ -305,19 +426,35 @@ class FolderScanner(QThread):
                         continue
 
                     # 匹配关键词
-                    if self.search_term in item.lower():
+                    # 将搜索词按空格分割成多个关键词
+                    search_terms = self.search_term.split()
+
+                    # 检查是否有任何关键词匹配（或关系）
+                    if any(term.lower() in item.lower() for term in search_terms):
                         if item_path not in self.scanned_paths:
                             self.scanned_paths.add(item_path)
 
                             # 只扫描匹配文件夹里的 "已修" 子文件夹
                             fixed_folder = os.path.join(item_path, "已修")
                             thumbnail_path = ""
+                            remark = ""  # 新增备注字段
                             if os.path.exists(fixed_folder):
                                 # 生成缩略图（如果有图片）
                                 thumbnail_path = self._generate_thumbnail(item_path, item)
 
+                                # 尝试读取产品信息 JSON
+                                safe_name = "".join(c for c in item if c not in "\\/:*?\"<>|")
+                                json_file_path = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
+                                if os.path.exists(json_file_path):
+                                    try:
+                                        with open(json_file_path, 'r', encoding='utf-8') as f:
+                                            data = json.load(f)
+                                            remark = data.get("remark", "")
+                                    except Exception:
+                                        remark = ""
+
                             # 发射信号
-                            self.folder_found.emit(item, item_path, thumbnail_path)
+                            self.folder_found.emit(item, item_path, thumbnail_path, remark)
                             self.found_count += 1
 
                         # 不再递归扫描子目录
@@ -449,103 +586,610 @@ class PreviewDialog(QDialog):
             dialog_geom.moveCenter(main_center)
             self.move(dialog_geom.topLeft() + self.offset)
 
-# ------------------ 文件夹列表项 Widget ------------------
-class FolderItemWidget(QWidget):
-    def __init__(self, name, thumbnail_path=None, note=''):
-        super().__init__()
-        self.thumbnail_path = thumbnail_path
-        self.note = note
-        self.preview_window = None  # 保存预览窗口引用
 
+# ==================== 高性能虚拟列表 ====================
+class HighPerformanceVirtualList(QAbstractScrollArea):
+    """高性能虚拟列表 - 专为大数据量设计"""
+    
+    # 自定义信号
+    itemClicked = pyqtSignal(int, dict)  # 点击信号：(索引, 数据)
+    itemDoubleClicked = pyqtSignal(int, dict)  # 双击信号
+    itemRightClicked = pyqtSignal(int, dict, QPoint)  # 右键信号
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        # 基本配置
+        self.item_height = 89  # 每个项目的高度
+        self.items_data = []   # 存储所有数据
+        
+        # Widget池 - 核心优化，只创建少量widget循环使用
+        self.visible_widgets = {}  # 当前可见的widget {index: widget}
+        self.widget_pool = []      # widget对象池
+        self.pool_size = 25        # 池大小，根据需要调整
+        
+        # 缩略图异步加载
+        self.thumbnail_executor = ThreadPoolExecutor(max_workers=3)
+        self.thumbnail_cache = {}     # 缩略图缓存 {path: pixmap}
+        self.loading_thumbnails = set()  # 正在加载的缩略图路径
+        
+        # 选中状态管理
+        self.selected_indices = set()
+        self.current_index = -1
+        
+        # 初始化
+        self._init_widget_pool()
+        self._setup_scrollbars()
+        self._setup_styling()
+        
+        # 性能监控
+        self.performance_stats = {
+            'render_count': 0,
+            'cache_hits': 0,
+            'cache_misses': 0
+        }
+    
+    def _init_widget_pool(self):
+        """初始化widget对象池"""
+        for _ in range(self.pool_size):
+            widget = VirtualFolderItemWidget()
+            widget.hide()  # 初始隐藏
+            # 连接widget的信号到虚拟列表
+            widget.clicked.connect(self._on_widget_clicked)
+            widget.double_clicked.connect(self._on_widget_double_clicked)
+            widget.right_clicked.connect(self._on_widget_right_clicked)
+            self.widget_pool.append(widget)
+
+    # 支持 Home/End
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Home:
+            # 滚动到顶部
+            self.verticalScrollBar().setValue(0)
+            # 选中第一项（如果有数据）
+            if self.items_data:
+                self.current_index = 0
+                self.viewport().update()
+        elif event.key() == Qt.Key_End:
+            # 滚动到底部
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+            # 选中最后一项（如果有数据）
+            if self.items_data:
+                self.current_index = len(self.items_data) - 1
+                self.viewport().update()
+        else:
+            super().keyPressEvent(event)
+
+    # 自动获取焦点
+    def mousePressEvent(self, event):
+        self.setFocus()
+        super().mousePressEvent(event)
+
+    def wheelEvent(self, event):
+        self.setFocus()
+        super().wheelEvent(event)
+    
+    def _setup_scrollbars(self):
+        """设置滚动条"""
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        
+    def _setup_styling(self):
+        """设置样式"""
+        self.setStyleSheet("""
+            QAbstractScrollArea {
+                background-color: black;
+                border: 1px solid #ddd;
+            }
+        """)
+    
+    def set_data(self, data_list):
+        """设置数据 - 核心方法，瞬间完成"""
+        self.items_data = data_list[:]  # 复制数据
+        self.selected_indices.clear()
+        self.current_index = -1
+        
+        self._update_scrollbar_range()
+        self._update_visible_items()
+    
+    def _update_scrollbar_range(self):
+        """更新滚动条范围"""
+        if not self.items_data:
+            self.verticalScrollBar().setRange(0, 0)
+            return
+            
+        total_height = len(self.items_data) * self.item_height
+        viewport_height = self.viewport().height()
+        max_scroll = max(0, total_height - viewport_height)
+        
+        self.verticalScrollBar().setRange(0, max_scroll)
+        self.verticalScrollBar().setPageStep(viewport_height)
+        self.verticalScrollBar().setSingleStep(self.item_height)
+    
+    def _update_visible_items(self):
+        """更新可见项目 - 核心渲染逻辑"""
+        self.performance_stats['render_count'] += 1
+
+        if not self.items_data:
+            self._clear_all_widgets()
+            return
+
+        viewport_rect = self.viewport().rect()
+        scroll_value = self.verticalScrollBar().value()
+
+        # 可见范围 + 缓冲
+        buffer_size = 3
+        start_index = max(0, scroll_value // self.item_height - buffer_size)
+        end_index = min(len(self.items_data), (scroll_value + viewport_rect.height()) // self.item_height + buffer_size + 1)
+
+        current_visible = set(range(start_index, end_index))
+        old_visible = set(self.visible_widgets.keys())
+
+        # 回收不可见widget
+        for index in old_visible - current_visible:
+            self._return_widget_to_pool(index)
+
+        # 创建新可见widget
+        for index in current_visible - old_visible:
+            if 0 <= index < len(self.items_data):
+                self._create_visible_widget(index)
+
+        # 更新位置、状态和缩略图
+        for index, widget in self.visible_widgets.items():
+            y_pos = index * self.item_height - scroll_value
+            widget.setGeometry(0, y_pos, viewport_rect.width(), self.item_height)
+            widget.show()
+            
+            # 更新 widget 数据内容
+            widget.update_data(self.items_data[index], index)
+            
+            widget.set_selected(index in self.selected_indices)
+            widget.set_current(index == self.current_index)
+
+            # 缩略图缓存立即显示
+            thumbnail_path = self.items_data[index].get("thumbnail", "")
+            if thumbnail_path in self.thumbnail_cache:
+                widget.set_thumbnail(self.thumbnail_cache[thumbnail_path])
+                self.performance_stats['cache_hits'] += 1
+
+        # 异步加载未缓存的缩略图
+        self._load_visible_thumbnails(start_index, end_index)
+    
+    def _create_visible_widget(self, index):
+        """创建可见widget"""
+        data = self.items_data[index]
+        widget = self._get_widget_from_pool()
+        widget.update_data(data, index)
+        widget.setParent(self.viewport())
+
+        # 如果缩略图已缓存，立即显示
+        thumbnail_path = data.get("thumbnail", "")
+        if thumbnail_path in self.thumbnail_cache:
+            widget.set_thumbnail(self.thumbnail_cache[thumbnail_path])
+            self.performance_stats['cache_hits'] += 1
+
+        self.visible_widgets[index] = widget
+    
+    def _get_widget_from_pool(self):
+        """从对象池获取widget"""
+        if self.widget_pool:
+            return self.widget_pool.pop()
+        else:
+            # 池空了，创建新的（正常情况不应该发生）
+            widget = VirtualFolderItemWidget()
+            widget.clicked.connect(self._on_widget_clicked)
+            widget.double_clicked.connect(self._on_widget_double_clicked)
+            widget.right_clicked.connect(self._on_widget_right_clicked)
+            return widget
+    
+    def _return_widget_to_pool(self, index):
+        """将widget返回对象池"""
+        if index not in self.visible_widgets:
+            return
+            
+        widget = self.visible_widgets.pop(index)
+        widget.hide()
+        widget.setParent(None)
+        
+        # 清理状态
+        widget.clear_data()
+        
+        # 返回池中
+        if len(self.widget_pool) < self.pool_size:
+            self.widget_pool.append(widget)
+    
+    def _clear_all_widgets(self):
+        """清空所有widget"""
+        for index in list(self.visible_widgets.keys()):
+            self._return_widget_to_pool(index)
+    
+    def _load_visible_thumbnails(self, start_index, end_index):
+        """异步加载可见区域尚未缓存的缩略图"""
+        for i in range(start_index, min(end_index, len(self.items_data))):
+            if i not in self.visible_widgets:
+                continue
+
+            data = self.items_data[i]
+            thumbnail_path = data.get("thumbnail", "")
+            if not thumbnail_path or not os.path.exists(thumbnail_path):
+                continue
+
+            # 已缓存或正在加载则跳过
+            if thumbnail_path in self.thumbnail_cache or thumbnail_path in self.loading_thumbnails:
+                continue
+
+            self.loading_thumbnails.add(thumbnail_path)
+            self.thumbnail_executor.submit(self._load_thumbnail, i, thumbnail_path)
+    
+    def _load_thumbnail(self, index, thumbnail_path):
+        """在后台线程加载缩略图"""
+        try:
+            pixmap = QPixmap(thumbnail_path)
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.thumbnail_cache[thumbnail_path] = scaled_pixmap
+                self.performance_stats['cache_misses'] += 1
+                
+                # 通知主线程更新UI
+                QMetaObject.invokeMethod(self, "_update_thumbnail_ui", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(int, index),
+                                       Q_ARG(str, thumbnail_path))
+        except Exception as e:
+            print(f"加载缩略图失败 {thumbnail_path}: {e}")
+        finally:
+            self.loading_thumbnails.discard(thumbnail_path)
+    
+    @pyqtSlot(int, str)
+    def _update_thumbnail_ui(self, index, thumbnail_path):
+        """在主线程更新缩略图UI"""
+        if (index in self.visible_widgets and 
+            thumbnail_path in self.thumbnail_cache):
+            widget = self.visible_widgets[index]
+            widget.set_thumbnail(self.thumbnail_cache[thumbnail_path])
+            self.performance_stats['cache_hits'] += 1
+    
+    # ==================== 事件处理 ====================
+    
+    def _on_scroll(self):
+        """滚动事件处理"""
+        self._update_visible_items()
+    
+    def _on_widget_clicked(self, widget):
+        """处理widget点击事件"""
+        index = widget.get_index()
+        if 0 <= index < len(self.items_data):
+            self.current_index = index
+            
+            # 处理选中状态
+            modifiers = QApplication.keyboardModifiers()
+            if modifiers & Qt.ControlModifier:
+                # Ctrl+点击：切换选中状态
+                if index in self.selected_indices:
+                    self.selected_indices.remove(index)
+                else:
+                    self.selected_indices.add(index)
+            elif modifiers & Qt.ShiftModifier:
+                # Shift+点击：范围选择
+                if self.selected_indices:
+                    start = min(self.selected_indices)
+                    end = max(self.selected_indices)
+                    self.selected_indices = set(range(min(start, index), max(end, index) + 1))
+                else:
+                    self.selected_indices = {index}
+            else:
+                # 普通点击：单选
+                self.selected_indices = {index}
+            
+            self._update_visible_items()  # 刷新选中状态显示
+            self.itemClicked.emit(index, self.items_data[index])
+
+    def _on_widget_right_clicked(self, widget, pos):
+        """右键点击时处理选中状态，并发射右键信号"""
+        index = widget.get_index()
+        if 0 <= index < len(self.items_data):
+            # 如果当前只有一个或没有选中，则右键单选
+            if len(self.selected_indices) <= 1:
+                self.selected_indices = {index}
+                self.current_index = index
+                self._update_visible_items()  # 刷新选中状态显示
+
+            # 发射右键信号（不管是多选还是单选都发射）
+            global_pos = widget.mapToGlobal(pos)
+            self.itemRightClicked.emit(index, self.items_data[index], global_pos)
+   
+    def _on_widget_double_clicked(self, widget):
+        """处理widget双击事件"""
+        index = widget.get_index()
+        if 0 <= index < len(self.items_data):
+            self.itemDoubleClicked.emit(index, self.items_data[index])
+    
+    def resizeEvent(self, event):
+        """窗口大小改变事件"""
+        super().resizeEvent(event)
+        self._update_scrollbar_range()
+        self._update_visible_items()
+    
+    def paintEvent(self, event):
+        """绘制事件 - 基本为空，由widget自己绘制"""
+        painter = QPainter(self.viewport())
+        painter.fillRect(self.viewport().rect(), Qt.transparent)
+    
+    # ==================== 公共API ====================
+    
+    def get_selected_data(self):
+        """获取选中的数据"""
+        return [self.items_data[i] for i in self.selected_indices if 0 <= i < len(self.items_data)]
+    
+    def get_current_data(self):
+        """获取当前数据"""
+        if 0 <= self.current_index < len(self.items_data):
+            return self.items_data[self.current_index]
+        return None
+    
+    def clear_selection(self):
+        """清空选择"""
+        self.selected_indices.clear()
+        self.current_index = -1
+        self._update_visible_items()
+    
+    def select_all(self):
+        """全选"""
+        self.selected_indices = set(range(len(self.items_data)))
+        self._update_visible_items()
+    
+    def scroll_to_item(self, index):
+        """滚动到指定项目"""
+        if 0 <= index < len(self.items_data):
+            target_y = index * self.item_height
+            self.verticalScrollBar().setValue(target_y)
+    
+    def get_performance_stats(self):
+        """获取性能统计"""
+        return self.performance_stats.copy()
+
+
+# ==================== 2. 虚拟列表专用的FolderItemWidget ====================
+class VirtualFolderItemWidget(QWidget):
+    """专为虚拟列表设计的文件夹项目widget"""
+    
+    # 自定义信号
+    clicked = pyqtSignal(object)  # 传递widget自身
+    double_clicked = pyqtSignal(object)
+    right_clicked = pyqtSignal(object, QPoint)
+    
+    def __init__(self):
+        super().__init__()
+        self._index = -1
+        self._data = {}
+        self._selected = False
+        self._current = False
+        self._hovered = False  # 新增：hover状态
+        self.preview_window = None
+        
+        self._setup_ui()
+        
+        # 启用鼠标追踪以获取hover事件
+        self.setMouseTracking(True)
+    
+    def _setup_ui(self):
+        """设置UI结构"""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 0, 0)
         layout.setSpacing(5)
         layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
 
         # 文件夹名称
-        self.name_label = QLabel(name)
+        self.name_label = QLabel()
+        self.name_label.setContentsMargins(15, 5, 5, 5)
         self.name_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.name_label.setFixedWidth(100)
         layout.addWidget(self.name_label)
 
-        # 缩略图容器 70x70
-        self.icon_label = ClickableLabel()
+        # 缩略图容器
+        self.icon_label = QLabel()
         self.icon_label.setFixedSize(70, 70)
-        self.icon_label.setStyleSheet("border:1px solid #ccc;")
-        if thumbnail_path and os.path.exists(thumbnail_path):
-            pixmap = QPixmap(thumbnail_path).scaled(
-                70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.icon_label.setPixmap(pixmap)
-            self.icon_label.clicked.connect(self.show_preview)
+        self.icon_label.setStyleSheet("border:1px solid #ccc; background-color: #f8f9fa;")
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        self._set_default_icon()
         layout.addWidget(self.icon_label)
 
-        # 备注信息区域（垂直布局）
-        self.info_layout = QVBoxLayout()
-        self.info_layout.setContentsMargins(30, 5, 10, 5)
-        self.info_layout.setSpacing(5)
-        self.info_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        # 备注信息区域
+        info_layout = QVBoxLayout()
+        info_layout.setContentsMargins(30, 5, 20, 5)
+        info_layout.setSpacing(5)
+        info_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         
-        # 备注标签（如果有备注才显示）
-        self.note_label = QLabel()
-        self.note_label.setWordWrap(True)
-        self.note_label.setStyleSheet("""
-            color: #495057; 
-            font-size: 12px; 
-        """)
-        self.update_note_display()
-        self.info_layout.addWidget(self.note_label)
+        self.remark_label = QLabel()
+        self.remark_label.setWordWrap(True)
+        info_layout.addWidget(self.remark_label)
 
-        # 在缩略图后面插入弹簧，把 info_layout 推到最右边
         layout.addStretch(1)
-
-        layout.addLayout(self.info_layout)
-
-    def show_preview(self):
-        if self.thumbnail_path and os.path.exists(self.thumbnail_path):
-            # 直接传主窗口实例
+        layout.addLayout(info_layout)
+        
+        # 设置默认样式
+        self._update_style()
+    
+    def _set_default_icon(self):
+        """设置默认文件夹图标"""
+        pixmap = QPixmap(70, 70)
+        pixmap.fill(QColor("#f0f0f0"))
+        painter = QPainter(pixmap)
+        painter.setPen(QColor("#ccc"))
+        painter.drawRect(0, 0, 69, 69)
+        # 简单的文件夹图标
+        painter.fillRect(20, 25, 30, 25, QColor("#ffd700"))
+        painter.fillRect(20, 20, 15, 8, QColor("#ffd700"))
+        painter.end()
+        self.icon_label.setPixmap(pixmap)
+    
+    def update_data(self, data, index):
+        """更新widget数据"""
+        self._data = data
+        self._index = index
+        
+        # 更新显示内容
+        name = data.get("name", "未知文件夹")
+        remark = data.get("remark", "")
+        path = data.get("path", "")
+        
+        self.name_label.setText(name)
+        self.remark_label.setText(remark)
+        
+        # 设置tooltip
+        tooltip = f"路径: {path}"
+        if remark:
+            tooltip += f"\n备注: {remark}"
+        self.setToolTip(tooltip)
+        
+        # 重置为默认图标，缩略图将异步加载
+        self._set_default_icon()
+    
+    def clear_data(self):
+        """清理数据时也要重置hover状态"""
+        self._data = {}
+        self._index = -1
+        self._selected = False
+        self._current = False
+        self._hovered = False  # 重置hover状态
+        self.name_label.setText("")
+        self.remark_label.setText("")
+        self.setToolTip("")
+        self._set_default_icon()
+        self._update_style()
+    
+    def set_thumbnail(self, pixmap):
+        """设置缩略图"""
+        self.icon_label.setPixmap(pixmap)
+        # 连接预览功能
+        self.icon_label.mousePressEvent = self._on_icon_clicked
+    
+    def _on_icon_clicked(self, event):
+        """缩略图点击事件"""
+        if event.button() == Qt.LeftButton and self._data.get("thumbnail"):
+            self._show_preview()
+    
+    def _show_preview(self):
+        """显示预览窗口"""
+        thumbnail_path = self._data.get("thumbnail", "")
+        if thumbnail_path and os.path.exists(thumbnail_path):
             main_window = QApplication.activeWindow()  
             self.preview_window = PreviewDialog(
-                self.thumbnail_path, main_window=main_window, offset=QPoint(150, 170) #预览窗口偏移距离
+                thumbnail_path, main_window=main_window, offset=QPoint(150, 170)
             )
             self.preview_window.show()
+    
+    def set_selected(self, selected):
+        self._selected = selected
+        self._update_style()
+    
+    def set_current(self, current):
+        self._current = current
+        self._update_style()
+    
+    def set_hovered(self, hovered):
+        self._hovered = hovered
+        self._update_style()
+    
+    def _update_style(self):
+        """只更新文字颜色"""
+        text_color = "#495057"
+        
+        self.name_label.setStyleSheet(f"color: {text_color}; background-color: transparent;")
+        self.remark_label.setStyleSheet(f"color: {text_color}; background-color: transparent;")
+        self.update()  # 刷新 widget，触发 paintEvent
 
-    def update_thumbnail(self, new_path):
-        """更新缩略图"""
-        self.thumbnail_path = new_path
-        if new_path and os.path.exists(new_path):
-            pixmap = QPixmap(new_path)
-            pixmap = pixmap.scaled(
-                70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.icon_label.setPixmap(pixmap)
-            # 重新连接点击事件
-            if not self.icon_label.clicked.connect(self.show_preview):
-                self.icon_label.clicked.connect(self.show_preview)
+    def paintEvent(self, event):
+        """绘制圆角背景，实现整行高亮"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)  # 开启抗锯齿
+        
+        # 选择背景颜色
+        if self._current:
+            bg_color = QColor("#bbdefb")
+        elif self._selected:
+            bg_color = QColor("#bbdefb")
+        elif self._hovered:
+            bg_color = QColor("#e3f2fd")
+        else:
+            bg_color = Qt.transparent
+        
+        painter.setBrush(QBrush(bg_color))
+        painter.setPen(Qt.NoPen)  # 去掉边框
+        
+        # 绘制圆角矩形
+        radius = 6  # 圆角半径
+        rect = self.rect().adjusted(0, 0, -1, -1)  # 避免右下角被裁切
+        painter.drawRoundedRect(rect, radius, radius)
+        
+        # 调用父类绘制子控件
+        super().paintEvent(event)
+    
+    def get_index(self):
+        """获取索引"""
+        return self._index
+    
+    def get_data(self):
+        """获取数据"""
+        return self._data.copy()
+    
+    #事件处理
+    def mousePressEvent(self, event):
+        """鼠标按下事件"""
+        parent_list = self.parent()
+        while parent_list and not isinstance(parent_list, HighPerformanceVirtualList):
+            parent_list = parent_list.parent()
 
-    def update_note(self, note):
-        """更新备注显示"""
-        self.note = note
-        self.update_note_display()
-    def update_note_display(self):
-        """更新备注显示状态"""
-        self.note_label.setText(self.note)
-    def get_note(self):
-        """获取当前备注"""
-        return self.note
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self)
 
-    def set_name(self, name):
-        """设置文件夹名称"""
-        self.name_label.setText(name)
+        elif event.button() == Qt.RightButton and parent_list:
+            # 如果当前已是多选，右键不改变选中状态
+            if len(parent_list.selected_indices) <= 1:
+                # 普通右键单选
+                parent_list.current_index = self.get_index()
+                parent_list.selected_indices = [self.get_index()]
+
+            # 调用右键回调
+            parent_list._on_widget_right_clicked(self, event.pos())
+
+        super().mousePressEvent(event)
+
+    
+    def mouseDoubleClickEvent(self, event):
+        """鼠标双击事件"""
+        if event.button() == Qt.LeftButton:
+            self.double_clicked.emit(self)
+        super().mouseDoubleClickEvent(event)
+
+    #手动hover事件处理 
+    def enterEvent(self, event):
+        """鼠标进入事件"""
+        self.set_hovered(True)
+        super().enterEvent(event)
+    
+    def leaveEvent(self, event):
+        """鼠标离开事件"""
+        self.set_hovered(False)
+        super().leaveEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件 - 确保hover状态正确"""
+        if not self._hovered:
+            self.set_hovered(True)
+        super().mouseMoveEvent(event)
 
 # -------------------- 子线程 加载数据库 --------------------
 class LoadFoldersThread(QThread):
-    folder_loaded = pyqtSignal(dict, int, int)  # 增加当前索引 & 总数
-    load_finished = pyqtSignal(int)             # 加载完成时传递总数
+    """优化后的数据加载线程"""
+    folder_loaded = pyqtSignal(dict, int, int)
+    load_finished = pyqtSignal(int)
+    batch_loaded = pyqtSignal(list, int, int)  # 新增批量信号
 
-    def __init__(self, database_file):
+    def __init__(self, database_file, batch_size=100):
         super().__init__()
         self.database_file = database_file
+        self.batch_size = batch_size  # 批量大小
 
     def run(self):
         if not os.path.exists(self.database_file):
@@ -554,14 +1198,14 @@ class LoadFoldersThread(QThread):
             return
 
         try:
-            import json, time
             with open(self.database_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+                
             if isinstance(data, list):
                 total = len(data)
-                for i, folder in enumerate(data, start=1):
-                    self.folder_loaded.emit(folder, i, total)
-                    time.sleep(0.01)
+                print(f"[LoadFoldersThread] 开始加载 {total} 条记录")    
+                # 批量发送模式
+                self._send_batch_data(data, total)
             else:
                 print("[LoadFoldersThread] JSON 格式错误，期望 list")
                 total = 0
@@ -570,9 +1214,21 @@ class LoadFoldersThread(QThread):
             total = 0
         finally:
             self.load_finished.emit(total)
+    
+    def _send_batch_data(self, data, total):
+        """批量发送数据（推荐）"""
+        for i in range(0, len(data), self.batch_size):
+            batch = data[i:i + self.batch_size]
+            current = min(i + self.batch_size, total)
+            
+            # 发送批量数据
+            self.batch_loaded.emit(batch, current, total)
+            
+            # 适当休眠，避免UI阻塞
+            if i % (self.batch_size * 10) == 0:  # 每1000条休眠一次
+                self.msleep(1)
 
-
-# -------------------- 主程序 --------------------
+# -------------------- 主线程/主程序 --------------------
 class FolderDatabaseApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -584,19 +1240,17 @@ class FolderDatabaseApp(QMainWindow):
         self.config = self.load_config()
         self.scanner_thread = None
         self.zip_thread = None
-        self.added_folder_paths = set()  # 用于记录所有已经添加到数据库的文件夹路径
-        self.folders_data = []
+        self.added_folder_paths = set()
         self.database_load_finished = False
         self.total_num = 0
         
+        self.folders_data = []  # 只存储数据，不创建widget
+        
         self.init_ui()
-        self.center_window()  # 窗口居中
+        self.center_window()
 
-        # 启动子线程加载数据（不阻塞UI）
-        self.load_thread = LoadFoldersThread(self.database_file)
-        self.load_thread.folder_loaded.connect(self.add_folder_to_list_realtime)  # 每加载一个文件夹就显示
-        self.load_thread.load_finished.connect(self.on_load_finished)    # 所有加载完成后调用
-        self.load_thread.start()
+        # 加载数据库
+        self.load_database()         
         
     def center_window(self):
         """窗口居中显示"""
@@ -649,23 +1303,7 @@ class FolderDatabaseApp(QMainWindow):
             QPushButton:disabled {
                 background-color: #6c757d;
                 color: #adb5bd;
-            }
-            
-            /* 危险按钮（清空数据库） */
-            QPushButton#clearButton {
-                background-color: #f5f5f5;
-                color: #495057;
-            }
-            
-            QPushButton#clearButton:hover {
-                background-color: #dc3545;
-                color: white;
-            }
-            
-            QPushButton#clearButton:pressed {
-                background-color: #bd2130;
-            }
-
+            }  
                            
             /* 选择文件夹按钮 */
             QPushButton#selectButton {
@@ -706,7 +1344,7 @@ class FolderDatabaseApp(QMainWindow):
             /* 标签样式 */
             QLabel {
                 color: #495057;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 500;
             }
             
@@ -725,40 +1363,9 @@ class FolderDatabaseApp(QMainWindow):
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 15px;
-                padding: 0 8px 0 8px;
+                padding: 2px 8px 2px 8px;
                 background-color: white;
-            }
-            
-            /* 列表控件样式 */
-            QListWidget {
-                border: 2px solid #e9ecef;
-                border-radius: 6px;
-                background-color: white;
-                alternate-background-color: #f8f9fa;
-                selection-background-color: #e3f2fd;
-                selection-color: #1976d2;
-                font-size: 13px;
-                padding: 4px;
-            }
-            
-            QListWidget::item {
-                border-radius: 4px;
-                padding: 8px 12px;
-                margin: 1px 0px;
-            }
-            
-            QListWidget::item:hover {
-                background-color: #f0f8ff;
-            }
-            
-            QListWidget::item:selected {
-                background-color: #e3f2fd;
-                color: #1976d2;
-                border: 1px solid #90caf9;
-            }
-            
-            QListWidget::item:selected:active {
-                background-color: #bbdefb;
+                border-radius: 8px;   /* 添加圆角 */
             }
             
             /* 右键菜单样式 */
@@ -842,10 +1449,10 @@ class FolderDatabaseApp(QMainWindow):
             
             /* 工具提示样式 */
             QToolTip {
-                background-color: #343a40;
-                color: white;
+                background-color: white;
+                color: #343a40;
                 border: none;
-                border-radius: 4px;
+                border-radius: 10px;
                 padding: 8px;
                 font-size: 12px;
             }
@@ -875,7 +1482,7 @@ class FolderDatabaseApp(QMainWindow):
         # 设置分割器比例
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([200, 400])
+        splitter.setSizes([150, 550])
         
         # 状态标签
         self.status_label = QLabel("🟢就绪")
@@ -886,16 +1493,11 @@ class FolderDatabaseApp(QMainWindow):
         """创建控制面板"""
         group_box = QGroupBox("扫描控制")
         layout = QVBoxLayout(group_box)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(20, 0, 20, 0)
         
         # 文件夹选择行
         folder_layout = QHBoxLayout()
         folder_layout.setSpacing(10)
-        
-        # folder_label = QLabel("扫描文件夹:")
-        # folder_label.setMinimumWidth(80)
-        # folder_layout.addWidget(folder_label)
         
         self.folder_path_edit = QLineEdit()
         self.folder_path_edit.setPlaceholderText("点击'选择文件夹'按钮选择要扫描的根目录")
@@ -907,7 +1509,6 @@ class FolderDatabaseApp(QMainWindow):
         self.browse_button.setObjectName("selectButton")
         self.browse_button.clicked.connect(self.browse_folder)
         self.browse_button.setMinimumWidth(120)
-        self.browse_button.setToolTip("点击选择要扫描的根目录")
         folder_layout.addWidget(self.browse_button)
         
         layout.addLayout(folder_layout)
@@ -916,12 +1517,8 @@ class FolderDatabaseApp(QMainWindow):
         search_layout = QHBoxLayout()
         search_layout.setSpacing(10)
         
-        # search_label = QLabel("搜索词:")
-        # search_label.setMinimumWidth(80)
-        # search_layout.addWidget(search_label)
-        
         self.search_term_edit = QLineEdit()
-        self.search_term_edit.setPlaceholderText("输入要写入数据库的子文件夹名称关键词，例如: LM")
+        self.search_term_edit.setPlaceholderText("输入子文件夹名称关键词，可用空格分隔多个关键词")
         self.search_term_edit.setMinimumHeight(36)
         
         # 加载上次保存的搜索词
@@ -934,7 +1531,6 @@ class FolderDatabaseApp(QMainWindow):
         self.add_button = QPushButton("写入数据库")
         self.add_button.clicked.connect(self.scan_and_add)
         self.add_button.setMinimumWidth(120)
-        self.add_button.setToolTip("扫描并添加匹配的文件夹到数据库")
         search_layout.addWidget(self.add_button)
         
         layout.addLayout(search_layout)
@@ -952,12 +1548,8 @@ class FolderDatabaseApp(QMainWindow):
         db_search_layout = QHBoxLayout()
         db_search_layout.setSpacing(10)
         
-        # search_label = QLabel("搜索数据库:")
-        # search_label.setMinimumWidth(90)
-        # db_search_layout.addWidget(search_label)
-        
         self.db_search_edit = QLineEdit()
-        self.db_search_edit.setPlaceholderText("输入关键词搜索已保存的文件夹，可用空格分隔多个关键词")
+        self.db_search_edit.setPlaceholderText("输入关键词搜索文件夹，可用空格分隔多个关键词")
         self.db_search_edit.setMinimumHeight(36)
 
         icon_path = os.path.join(os.getcwd(), "icon", "search.png")
@@ -973,100 +1565,522 @@ class FolderDatabaseApp(QMainWindow):
 
         db_search_layout.addWidget(self.db_search_edit)
         
-        self.clear_db_button = QPushButton("清空数据库")
+        # 清空数据库按钮
+        self.clear_db_button = QPushButton()
         self.clear_db_button.setObjectName("clearButton")
         self.clear_db_button.clicked.connect(self.clear_database)
-        self.clear_db_button.setMinimumWidth(120)
-        self.clear_db_button.setToolTip("清空所有数据库记录")
+        self.clear_db_button.setMinimumWidth(36)
+        self.clear_db_button.setMinimumHeight(36)
+        self.clear_db_button.setIcon(QIcon("icon/clear.png"))
+        self.clear_db_button.setIconSize(QSize(20, 20))
+        self.clear_db_button.setToolTip("清空数据库")
         db_search_layout.addWidget(self.clear_db_button)
-        
+
+        # 清除内边距
+        self.clear_db_button.setStyleSheet("""
+            QPushButton#clearButton {
+                background-color: #f0f0f0;
+                border: none;
+                padding: 10px 15px 10px 15px;
+                margin: 0px 0px 0px 0px;
+            }
+            QPushButton#clearButton:hover {
+                background-color: #dc3545;
+                border-radius: 4px;
+            }
+            QPushButton#clearButton:pressed {
+                background-color: #bd2130;
+            }
+        """)
+        # 设置图标hover效果
+        self.setup_hover_effects()
+
+        # 菜单按钮
+        self.setup_menu_button()
+        db_search_layout.addWidget(self.menu_button)
+
         layout.addLayout(db_search_layout)
         
-        # 文件夹列表
-        self.folder_list = QListWidget()
+        # 创建虚拟列表
+        self.folder_list = HighPerformanceVirtualList()
+        self.folder_list.setStyleSheet("""
+            HighPerformanceVirtualList {
+                border: 2px solid #e9ecef;
+                border-radius: 6px;
+                background-color: white;
+            }
+        """)
+        
+        # 连接虚拟列表的信号
+        # self.folder_list.itemClicked.connect(self.on_folder_item_clicked)
         self.folder_list.itemDoubleClicked.connect(self.open_folder)
-        self.folder_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.folder_list.customContextMenuRequested.connect(self.show_context_menu)
-        # 设置多选模式
-        self.folder_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.folder_list.setAlternatingRowColors(True)
+        self.folder_list.itemRightClicked.connect(self.show_context_menu)
         
         layout.addWidget(self.folder_list)
         
         return group_box
 
-    def show_context_menu(self, position):
-        """显示右键菜单"""
-        selected_items = self.folder_list.selectedItems()
-        if not selected_items:
+    #---------以下是菜单项逻辑------------------------------------------------
+    def setup_menu_button(self):
+        """设置菜单按钮和相关功能"""
+        # 创建菜单按钮
+        self.menu_button = QPushButton()
+        self.menu_button.setObjectName("menuButton")
+        self.menu_button.setMinimumWidth(50)
+        self.menu_button.setMinimumHeight(36)
+        self.menu_button.setIcon(QIcon("icon/menu.png"))
+        self.menu_button.setIconSize(QSize(20, 20))
+        
+        # 按钮样式定义
+        self.normal_style = """
+            QPushButton#menuButton {
+                background-color: #f0f0f0;
+                border: none;
+                padding: 10px 15px 10px 15px;
+                margin: 0px 0px 0px 0px;
+                border-radius: 4px;
+            }
+        """
+        
+        self.hover_style = """
+            QPushButton#menuButton {
+                background-color: #007bff;
+                border: none;
+                padding: 10px 15px 10px 15px;
+                margin: 0px 0px 0px 0px;
+                border-radius: 4px;
+            }
+        """
+        
+        # 设置初始样式
+        self.menu_button.setStyleSheet(self.normal_style)
+        
+        # 安装事件过滤器并开启鼠标跟踪
+        self.menu_button.setMouseTracking(True)
+        self.menu_button.installEventFilter(self)
+        
+        # 创建菜单
+        self.menu = QMenu(self)
+        self.menu.setWindowFlags(self.menu.windowFlags() | Qt.FramelessWindowHint)
+        self.menu.setAttribute(Qt.WA_TranslucentBackground)
+        
+        # 菜单样式
+        self.menu.setStyleSheet("""
+            QMenu {
+                background-color: white;
+                border: 1px solid #dee2e6;
+                border-radius: 6px;
+                padding: 4px 0px;
+                font-size: 13px;
+            }
+            
+            QMenu::item {
+                padding: 8px 20px;
+                margin: 2px 4px;
+                border-radius: 4px;
+                color: #495057;
+            }
+            
+            QMenu::item:selected {
+                background-color: #e3f2fd;
+                color: #1976d2;
+            }
+            
+            QMenu::item:pressed {
+                background-color: #bbdefb;
+            }
+            
+            QMenu::separator {
+                height: 1px;
+                background-color: #dee2e6;
+                margin: 4px 8px;
+            }
+        """)
+        
+        # 添加菜单项
+        import_action = self.menu.addAction("导入产品信息")
+        import_action.triggered.connect(self.import_product_info)
+        
+        # export_action = self.menu.addAction("导出数据")
+        # export_action.triggered.connect(self.export_data)
+        # self.menu.addSeparator()
+        # settings_action = self.menu.addAction("设置")
+        # settings_action.triggered.connect(self.show_settings)
+        
+        # 安装事件过滤器并开启鼠标跟踪
+        self.menu.setMouseTracking(True)
+        self.menu.installEventFilter(self)
+        
+        # 连接菜单项点击信号
+        self.menu.triggered.connect(self._on_menu_triggered)
+        
+        # leave_timer：当鼠标完全移出时，延迟隐藏菜单
+        self.leave_timer = QTimer(self)
+        self.leave_timer.setSingleShot(True)
+        self.leave_timer.timeout.connect(self._try_hide)
+        
+        # click_block_timer：短暂屏蔽菜单重现的定时器
+        self.click_block_timer = QTimer(self)
+        self.click_block_timer.setSingleShot(True)
+        self.click_block_timer.timeout.connect(self._reset_just_clicked)
+        
+        # 状态标记
+        self.just_clicked = False
+        self.ignore_menu_area = False
+        
+    def eventFilter(self, obj, event):
+        """
+        事件过滤器：处理菜单按钮和菜单的鼠标事件
+        hover图标跟随菜单的显示隐藏，而不是实时跟随鼠标
+        """
+        if event.type() in (QEvent.Enter, QEvent.Leave, QEvent.MouseMove, QEvent.HoverMove):
+            cursor_pos = QCursor.pos()
+            
+            # 计算按钮在屏幕上的全局矩形
+            btn_top_left = self.menu_button.mapToGlobal(QPoint(0, 0))
+            btn_rect_global = self.menu_button.rect().translated(btn_top_left)
+            
+            # 菜单的全局矩形
+            menu_rect_global = self.menu.geometry()
+            
+            # 判断是否在相关区域内
+            if self.ignore_menu_area:
+                # 限制模式：只识别按钮区域
+                in_relevant_area = btn_rect_global.contains(cursor_pos)
+            else:
+                # 正常模式：识别按钮或菜单区域
+                in_relevant_area = btn_rect_global.contains(cursor_pos) or menu_rect_global.contains(cursor_pos)
+            
+            if in_relevant_area:
+                if self.ignore_menu_area and btn_rect_global.contains(cursor_pos):
+                    # 限制模式下鼠标在按钮上
+                    if not self.just_clicked:
+                        self.show_menu()  # 这里会处理图标显示
+                    self.just_clicked = False
+                    return super().eventFilter(obj, event)
+                elif not self.ignore_menu_area:
+                    # 正常模式
+                    if self.just_clicked:
+                        # 如果刚点击过菜单项，只停止隐藏定时器
+                        if self.leave_timer.isActive():
+                            self.leave_timer.stop()
+                        return super().eventFilter(obj, event)
+                    # 显示菜单（会处理图标显示）
+                    self.show_menu()
+            else:
+                # 鼠标不在相关区域：启动延迟隐藏菜单（会处理图标隐藏）
+                if self.menu.isVisible() and not self.leave_timer.isActive():
+                    self.leave_timer.start(300)
+        
+        return super().eventFilter(obj, event)
+
+    def show_menu(self):
+        """显示菜单时同时显示hover图标"""
+        # 菜单已经可见时，只停止隐藏定时器，不重复弹出
+        if self.menu.isVisible():
+            self.leave_timer.stop()
             return
-        context_menu = QMenu(self)
-        context_menu.setFixedWidth(200)
-
-        # 生成原图证明文件
-        generate_text = f"生成原图证明文件 ({len(selected_items)}个)" if len(selected_items) > 1 else "生成原图证明文件"
-        generate_action = QAction(generate_text, self)
-        generate_action.setToolTip("为选中的文件夹生成原图证明文档")
-        generate_action.triggered.connect(lambda: self.generate_original_proof(selected_items))
-        context_menu.addAction(generate_action)
         
-        context_menu.addSeparator()
+        # 从按钮重新打开菜单时，恢复识别菜单区域
+        self.ignore_menu_area = False
+        # 取消任何待执行的隐藏操作
+        self.leave_timer.stop()
         
-        # 编辑备注操作（仅单选时显示）
-        if len(selected_items) == 1:
-            context_menu.addSeparator()
-            edit_note_action = QAction("编辑备注", self)
-            edit_note_action.setToolTip("编辑此文件夹的备注信息")
-            edit_note_action.triggered.connect(lambda: self.edit_folder_note(selected_items[0]))
-            context_menu.addAction(edit_note_action)
+        # 显示菜单时：设置hover样式和hover图标
+        self.menu_button.setStyleSheet(self.hover_style)
+        self.menu_button.setIcon(QIcon("icon/menu_h.png"))
         
-        # 更换缩略图操作
-        if len(selected_items) == 1:
-            context_menu.addSeparator()
-            change_thumb_action = QAction("更换缩略图", self)
-            change_thumb_action.setToolTip("选择新图片作为此文件夹的缩略图")
-            change_thumb_action.triggered.connect(lambda: self.change_thumbnail(selected_items[0]))
-            context_menu.addAction(change_thumb_action)
+        # 计算菜单位置
+        button_rect = self.menu_button.rect()
+        button_pos = self.menu_button.mapToGlobal(QPoint(0, 0))
         
-        # 打开文件夹操作（仅单选时才显示）
-        if len(selected_items) == 1:
-            context_menu.addSeparator()
-            open_action = QAction("打开文件夹", self)
-            open_action.setToolTip("在文件资源管理器中打开此文件夹")
-            open_action.triggered.connect(lambda: self.open_folder(selected_items[0]))
-            context_menu.addAction(open_action)
-
-        context_menu.addSeparator()
-
-        # 删除操作
-        delete_text = f"从数据库中删除 ({len(selected_items)}个)" if len(selected_items) > 1 else "从数据库中删除"
-        delete_action = QAction(delete_text, self)
-        delete_action.setToolTip("从数据库中删除选中的文件夹记录")
-        delete_action.triggered.connect(lambda: self.delete_folders(selected_items))
-        context_menu.addAction(delete_action)
+        # 确保菜单已经布局完成，能获取正确尺寸
+        self.menu.adjustSize()
+        
+        # 计算位置：在按钮下方显示
+        menu_x = button_pos.x()
+        menu_y = button_pos.y() + button_rect.height() + 2
         
         # 显示菜单
-        context_menu.exec_(self.folder_list.mapToGlobal(position))
+        self.menu.popup(QPoint(int(menu_x), int(menu_y)))
 
-    def edit_folder_note(self, item):
-        """编辑文件夹备注"""
-        folder_path = item.data(Qt.UserRole)
+    def _try_hide(self):
+        """
+        定时器超时后检查是否隐藏菜单
+        只有真正隐藏菜单时才隐藏hover图标
+        """
+        cursor_pos = QCursor.pos()
         
-        # 从 folders_data 中找到对应的文件夹数据
-        folder_data = None
-        folder_index = None
-        for i, folder in enumerate(self.folders_data):
-            if folder.get('path') == folder_path:
-                folder_data = folder
-                folder_index = i
-                break
+        btn_top_left = self.menu_button.mapToGlobal(QPoint(0, 0))
+        btn_rect_global = self.menu_button.rect().translated(btn_top_left)
+        menu_rect_global = self.menu.geometry()
         
-        if folder_data is None:
-            QMessageBox.warning(self, "警告", "未找到文件夹数据")
+        # 根据当前模式判断相关区域
+        if self.ignore_menu_area:
+            in_relevant_area = btn_rect_global.contains(cursor_pos)
+        else:
+            in_relevant_area = btn_rect_global.contains(cursor_pos) or menu_rect_global.contains(cursor_pos)
+        
+        # 如果光标仍在相关区域，不做任何操作（保持菜单和hover图标显示）
+        if in_relevant_area:
             return
         
+        # 否则，隐藏菜单和hover图标
+        self._hide_menu_and_reset()
+
+    def _hide_menu_and_reset(self):
+        """隐藏菜单时同时隐藏hover图标"""
+        # 隐藏菜单
+        self.menu.hide()
+        # 恢复按钮正常状态：普通样式和普通图标
+        self.menu_button.setStyleSheet(self.normal_style)
+        self.menu_button.setIcon(QIcon("icon/menu.png"))
+
+    def _on_menu_triggered(self, action):
+        """
+        菜单项被点击时：立即隐藏菜单和hover图标
+        """
+        # 屏蔽短时重新弹出
+        self.just_clicked = True
+        if self.click_block_timer.isActive():
+            self.click_block_timer.stop()
+        self.click_block_timer.start(200)
+        
+        # 去除对菜单区域的识别，直到下一次从按钮触发
+        self.ignore_menu_area = True
+        # 立即隐藏菜单和hover图标
+        self._hide_menu_and_reset()
+
+    def _reset_just_clicked(self):
+        """200ms 后自动重置 just_clicked 标记"""
+        self.just_clicked = False
+
+    def _try_hide(self):
+        """
+        定时器超时后再次检查光标位置
+        如果光标仍不在相关区域，就隐藏菜单和hover图标
+        """
+        cursor_pos = QCursor.pos()
+        
+        btn_top_left = self.menu_button.mapToGlobal(QPoint(0, 0))
+        btn_rect_global = self.menu_button.rect().translated(btn_top_left)
+        menu_rect_global = self.menu.geometry()
+        
+        # 如果光标仍在按钮或菜单区域，保持hover图标和菜单显示
+        if btn_rect_global.contains(cursor_pos) or menu_rect_global.contains(cursor_pos):
+            return
+        
+        # 否则，隐藏菜单和hover图标，恢复正常状态
+        self._hide_menu_and_reset()
+
+    def _hide_menu_and_reset(self):
+        """隐藏菜单并恢复按钮正常状态（包括图标）"""
+        self.menu.hide()
+        self.menu_button.setStyleSheet(self.normal_style)
+        # 恢复普通图标
+        self.menu_button.setIcon(QIcon("icon/menu.png"))
+
+    # 导入产品信息
+    def import_product_info(self):
+        """导入产品信息""" 
+        # 创建对话框
+        dialog = QDialog(self)
+        dialog.setWindowTitle("产品信息导入")
+        dialog.setFixedSize(300, 100)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        
+        # 工作目录配置
+        work_dir = os.getcwd()
+        template_file = os.path.join(work_dir, "产品信息模板.xlsx")
+        
+        # 创建布局
+        layout = QVBoxLayout()
+            
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        # 下载模板文件按钮
+        download_btn = QPushButton("下载模板文件")
+        download_btn.setMinimumHeight(36)
+        button_layout.addWidget(download_btn)
+        
+        # 从模板文件导入按钮
+        import_btn = QPushButton("从模板文件导入")
+        import_btn.setMinimumHeight(36)
+        button_layout.addWidget(import_btn)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        
+        # 下载模板文件功能
+        def download_template():
+            try:
+                # 检查模板文件是否存在
+                if not os.path.exists(template_file):
+                    QMessageBox.warning(dialog, "错误", f"模板文件不存在：{template_file}")
+                    return
+                
+                # 让用户选择保存路径
+                save_path, _ = QFileDialog.getSaveFileName(
+                    dialog, 
+                    "保存模板文件", 
+                    r"C:\产品信息模板.xlsx",  # 默认路径+文件名
+                    "Excel文件 (*.xlsx)"
+                )
+
+                if save_path:
+                    # 复制文件
+                    shutil.copy2(template_file, save_path)
+                    QMessageBox.information(dialog, "成功", f"模板文件已保存到：\n{save_path}")
+                    
+            except Exception as e:
+                QMessageBox.critical(dialog, "错误", f"下载模板文件失败：\n{str(e)}")
+        
+        # 从模板导入功能
+        def import_from_template():
+            # 让用户选择要导入的Excel文件
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog,  # 用对话框作为父窗口
+                "选择要导入的模板文件",
+                r"C:\产品信息模板.xlsx",
+                "Excel文件 (*.xlsx *.xls)"
+            )
+            
+            if not file_path:
+                return
+            #开始导入
+            self.start_imort(file_path)
+            dialog.close()
+                    
+        # 连接按钮信号
+        download_btn.clicked.connect(download_template)
+        import_btn.clicked.connect(import_from_template)
+        
+        # 显示对话框
+        dialog.exec_()
+
+    def start_imort(self, file_path):
+        """开始导入"""
+        # 创建进度条对话框
+        self.progress_dialog = QProgressDialog("准备开始处理...", "取消", 0, 100, self)
+        self.progress_dialog.setWindowTitle("导入进度")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setMinimumWidth(500)
+        self.progress_dialog.resize(500, 120)
+        self.progress_dialog.show()
+
+        # 创建子线程
+        self.import_thread = ImportProductThread(self.folders_data, file_path)
+        self.import_thread.progress_changed.connect(
+            lambda percent, name: self.progress_dialog.setValue(percent) or self.progress_dialog.setLabelText(f"正在导入: {name}")
+        )
+        self.import_thread.finished.connect(self._on_import_finished)
+        self.import_thread.start()
+        self.status_label.setText(f"正在导入产品信息")
+
+    def _on_import_finished(self, updated_count, skipped_count):
+        self.progress_dialog.close()
+        # 保存数据库并刷新列表
+        self.save_database()
+        self.folder_list.update()
+        self.refresh_folder_list()
+
+        QMessageBox.information(self, "导入完成", f"导入完成！\n已更新数量：{updated_count}\n跳过数量：{skipped_count}")    
+    #---------以上是菜单项逻辑------------------------------------------------
+
+    def setup_hover_effects(self):
+        """设置按钮图标hover"""
+        self.clear_db_button.enterEvent = lambda event: self.clear_db_button.setIcon(QIcon("icon/clear_h.png"))
+        self.clear_db_button.leaveEvent = lambda event: self.clear_db_button.setIcon(QIcon("icon/clear.png"))
+
+    #虚拟列表回调
+    def get_selected_folders(self):
+        """获取选中的文件夹"""
+        return self.folder_list.get_selected_data()
+    
+    def get_current_folder(self):
+        """获取当前文件夹"""
+        return self.folder_list.get_current_data()
+   
+    #---------以下是右键菜单逻辑------------------------------------------------
+    def show_context_menu(self, index, data, global_pos):
+        # 直接用虚拟列表选中状态
+        selected_data = self.folder_list.get_selected_data()
+        selected_count = len(selected_data)
+
+        menu = QMenu(self)
+        menu.setFixedWidth(200)
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground)
+
+        # ---------------- 多选操作 ----------------
+        if selected_count > 1:
+            generate_text = f"生成原图证明文件 ({selected_count}个)"
+            generate_action = QAction(generate_text, self)
+            generate_action.triggered.connect(lambda: self.generate_original_proof(selected_data))
+            menu.addAction(generate_action)
+
+            menu.addSeparator()
+
+            delete_text = f"从数据库中删除 ({selected_count}个)"
+            delete_action = QAction(delete_text, self)
+            delete_action.triggered.connect(lambda: self.delete_folders(selected_data))
+            menu.addAction(delete_action)
+
+        # ---------------- 单选操作 ----------------
+        elif selected_count == 1:
+            folder_data = selected_data[0]
+
+            generate_action = QAction("生成原图证明文件", self)
+            generate_action.triggered.connect(lambda: self.generate_original_proof(selected_data))
+            menu.addAction(generate_action)
+
+            menu.addSeparator()
+            copy_path_action = QAction("复制文件夹路径", self)
+            copy_path_action.triggered.connect(lambda: self.copy_path(folder_data))
+            menu.addAction(copy_path_action)
+
+            menu.addSeparator()
+            edit_action = QAction("编辑备注", self)
+            edit_action.triggered.connect(lambda: self.edit_folder_remark(folder_data))
+            menu.addAction(edit_action)
+
+            menu.addSeparator()
+            change_thumb_action = QAction("更换缩略图", self)
+            change_thumb_action.triggered.connect(lambda: self.change_thumbnail(folder_data))
+            menu.addAction(change_thumb_action)
+
+            menu.addSeparator()
+            open_action = QAction("打开文件夹", self)
+            open_action.triggered.connect(lambda: self.open_folder(folder_data))
+            menu.addAction(open_action)
+
+            menu.addSeparator()
+            delete_action = QAction("从数据库中删除", self)
+            delete_action.triggered.connect(lambda: self.delete_folders(selected_data))
+            menu.addAction(delete_action)
+
+        # 显示菜单
+        menu.exec_(global_pos)
+        
+    def copy_path(self, folder_data):
+        """复制文件夹路径"""
+        folder_path = folder_data.get("path", "")
+        if folder_path:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(folder_path)
+            self.status_label.setText(f"已复制路径：{folder_path}")
+            QTimer.singleShot(2000, lambda: self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）"))
+
+    def edit_folder_remark(self, folder_data):
+        """编辑文件夹备注"""
+        folder_name = folder_data.get("name", "未知文件夹")
+        folder_path = folder_data.get("path", "")
+        
         # 获取当前备注
-        current_note = folder_data.get('note', '')
+        current_remark = folder_data.get("remark", "")
         
         # 创建备注编辑对话框
         dialog = QDialog(self)
@@ -1074,59 +2088,65 @@ class FolderDatabaseApp(QMainWindow):
         dialog.setFixedSize(400, 300)
         dialog.setWindowModality(Qt.WindowModal)
 
-        # 布局
         layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(5, 5, 5, 5)  # 控制布局的四周间距
-        layout.setSpacing(10)  # 控件之间的间距
+        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(10)
 
-        # 文件夹信息标签
-        folder_name = folder_data.get('name', '未知文件夹')
         info_label = QLabel(f"文件夹：{folder_name}")
         info_label.setStyleSheet("font-weight: bold; margin: 0; padding: 0;")
         layout.addWidget(info_label)
 
-        # 备注输入框
-        note_text = QTextEdit()
-        note_text.setPlainText(current_note)
-        note_text.setPlaceholderText("请输入备注信息...")
-        layout.addWidget(note_text)
-        
-        # 按钮布局
+        remark_text = QTextEdit()
+        remark_text.setPlainText(current_remark)
+        remark_text.setPlaceholderText("请输入备注信息...")
+        layout.addWidget(remark_text)
+
         button_layout = QHBoxLayout()
-        
-        # 确定按钮
         ok_button = QPushButton("确定")
         ok_button.clicked.connect(dialog.accept)
-        button_layout.addWidget(ok_button)
-        
-        # 取消按钮
         cancel_button = QPushButton("取消")
         cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(ok_button)
         button_layout.addWidget(cancel_button)
-        
         layout.addLayout(button_layout)
-        
-        # 设置焦点到文本框
-        note_text.setFocus()
-        
-        # 显示对话框
-        if dialog.exec_() == QDialog.Accepted:
-            # 获取新的备注内容
-            new_note = note_text.toPlainText().strip()
-            
-            # 更新 folders_data 中的备注
-            self.folders_data[folder_index]['note'] = new_note
-            
-            # 更新列表显示（如果您的 FolderItemWidget 支持显示备注）
-            widget = self.folder_list.itemWidget(item)
-            if hasattr(widget, 'update_note'):
-                widget.update_note(new_note)
 
-    def change_thumbnail(self, item):
+        remark_text.setFocus()
+
+        if dialog.exec_() == QDialog.Accepted:
+            new_remark = remark_text.toPlainText().strip()
+            folder_data["remark"] = new_remark  # 更新数据字典
+
+            # 更新虚拟列表中对应 widget
+            for index, data in enumerate(self.folder_list.items_data):
+                if data == folder_data:
+                    widget = self.folder_list.visible_widgets.get(index)
+                    if widget and hasattr(widget, "remark_label"):
+                        widget.remark_label.setText(new_remark)
+                    break
+
+            # 保存备注到【已修】子文件夹
+            try:
+                fixed_folder_path = os.path.join(folder_path, "已修")
+                os.makedirs(fixed_folder_path, exist_ok=True)
+                safe_name = "".join(c for c in folder_name if c not in "\\/:*?\"<>|")
+                json_file_path = os.path.join(fixed_folder_path, f"{safe_name}_产品信息.json")
+                
+                # 保存 JSON，新增 name 字段
+                with open(json_file_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "name": folder_name,
+                        "remark": new_remark
+                    }, f, ensure_ascii=False, indent=2)
+
+                self.save_database()
+            except Exception as e:
+                QMessageBox.warning(self, "保存失败", f"无法保存产品信息文件：{e}")
+
+
+    def change_thumbnail(self, folder_data):
         """更换缩略图"""
-        widget = self.folder_list.itemWidget(item)
-        folder_name = widget.name_label.text()
-        folder_path = item.data(Qt.UserRole)
+        folder_name = folder_data.get("name", "未知文件夹")
+        folder_path = folder_data.get("path", "")
 
         fixed_folder = os.path.join(folder_path, "已修")
         if not os.path.exists(fixed_folder):
@@ -1146,7 +2166,20 @@ class FolderDatabaseApp(QMainWindow):
         # 生成缩略图（主线程）
         new_thumb_path = self._generate_thumbnail_from_image(file_path, folder_name)
         if new_thumb_path:
-            widget.update_thumbnail(new_thumb_path)
+            # 更新数据字典
+            folder_data["thumbnail"] = new_thumb_path
+
+            # 缓存新的缩略图
+            pixmap = QPixmap(new_thumb_path).scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.folder_list.thumbnail_cache[new_thumb_path] = pixmap
+
+            # 更新虚拟列表中的可见 widget
+            for index, data in enumerate(self.folder_list.items_data):
+                if data == folder_data:
+                    widget = self.folder_list.visible_widgets.get(index)
+                    if widget:
+                        widget.set_thumbnail(pixmap)
+                    break
 
     def _generate_thumbnail_from_image(self, image_path, folder_name):
         """根据用户选择的图片生成 400x400 缩略图 (主线程调用)"""
@@ -1165,22 +2198,21 @@ class FolderDatabaseApp(QMainWindow):
         except Exception as e:
             print(f"生成缩略图失败: {e}")
             return ""
+    #---------以上是右键菜单逻辑------------------------------------------------
 
     #-----------------以下是生成原图证明文件压缩包逻辑----------------------------------------------
-    def generate_original_proof(self, selected_items):
+    def generate_original_proof(self, selected_data):
         """批量生成原图证明文件压缩包"""
-        if not selected_items:
+        if not selected_data:
             return
-        
-        # 检查所有文件夹是否存在
+
         invalid_folders = []
         valid_folders = []
-        
-        for item in selected_items:
-            folder_path = item.data(Qt.UserRole)
-            # 从路径中取最后一部分作为 folder_name
+
+        for data in selected_data:
+            folder_path = data.get("path", "")
             folder_name = os.path.basename(folder_path.rstrip(os.sep))
-            
+
             if not os.path.exists(folder_path):
                 invalid_folders.append(folder_name)
             else:
@@ -1278,6 +2310,7 @@ class FolderDatabaseApp(QMainWindow):
             self.progress_dialog = None
         
         self.status_label.setText("处理已取消")
+        QTimer.singleShot(2000, lambda: self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）"))
     def on_all_completed(self, results):
         """所有任务完成处理"""
         # 关闭进度对话框
@@ -1483,6 +2516,8 @@ class FolderDatabaseApp(QMainWindow):
     def scan_and_add(self):
         folder_path = self.folder_path_edit.text().strip()
         search_term = self.search_term_edit.text().strip()
+        self.config['last_search_term'] = search_term.replace('/', '\\')
+        self.save_config()
         
         if not folder_path:
             QMessageBox.warning(self, "警告", "请先选择要扫描的文件夹！")
@@ -1502,39 +2537,44 @@ class FolderDatabaseApp(QMainWindow):
 
         # 创建并启动扫描线程
         self.scanner_thread = FolderScanner(folder_path, search_term, added_paths=self.added_folder_paths)
-        self.scanner_thread.folder_found.connect(self.add_folder_to_list)
+
+        # 连接信号
+        self.scanner_thread.folder_found.connect(
+            lambda name, path, thumb, remark: self.add_folder_realtime({
+                'name': name,
+                'path': path,
+                'thumbnail': thumb,
+                'remark': remark
+            })
+        )
         self.scanner_thread.scan_finished.connect(self.scan_completed)
-        self.scanner_thread.update_status.connect(self.update_status_label)  # ✅ 连接实时状态信号
-        self.scanner_thread.start()  # 启动子线程，异步扫描
+        self.scanner_thread.update_status.connect(self.update_status_label)
+
+        # 启动线程
+        self.scanner_thread.start()
 
     def update_status_label(self, text):
         self.status_label.setText(text)
         QApplication.processEvents()  # 强制刷新界面
+        
+    def add_folder_realtime(self, folder):
+        """单条数据实时添加到虚拟列表"""
+        path = folder.get("path", "")
+        if not path or path in self.added_folder_paths:
+            return
 
-    def add_folder_to_list(self, folder_name, folder_path, thumbnail_path):
-        # 避免重复添加（双重保险，也可以只依赖 added_folder_paths）
-        if folder_path not in self.added_folder_paths:
-            # 添加到数据模型
-            self.folders_data.append({
-                'name': folder_name,
-                'path': folder_path,
-                'thumbnail': thumbnail_path
-            })
-            # 记录已添加路径
-            self.added_folder_paths.add(folder_path)  # ✅ 关键：记录已添加的路径
+        # 添加到数据源
+        self.folders_data.append(folder)
+        self.added_folder_paths.add(path)
 
-            # 添加到界面列表
-            item = QListWidgetItem()
-            widget = FolderItemWidget(folder_name, thumbnail_path)
-            item.setSizeHint(QSize(300, 89))
-            item.setData(Qt.UserRole, folder_path)
-            item.setToolTip(folder_path)
-            self.folder_list.addItem(item)
-            self.folder_list.setItemWidget(item, widget)
+        # 刷新虚拟列表
+        self.folder_list.set_data(self.folders_data[:])  # 传副本，避免引用问题
+        QApplication.processEvents()  # 强制刷新界面
+
     def scan_completed(self, found_count, skipped_count):
         # 恢复按钮状态
         self.add_button.setEnabled(True)  # 重新启用按钮
-        self.add_button.setText("写入数据库")  # 恢复为原始文字，比如“写入数据库”
+        self.add_button.setText("写入数据库")  
         status_text = f"扫描完成，找到 {found_count} 个匹配的文件夹，跳过了 {skipped_count} 个已添加的文件夹"
         self.status_label.setText(status_text)
 
@@ -1547,96 +2587,92 @@ class FolderDatabaseApp(QMainWindow):
             msg += "未找到新的匹配文件夹。"
 
         QMessageBox.information(self, "扫描完成", msg)
-        self.total_num = found_count
+        self.total_num = self.total_num + found_count
         self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
         self.save_database()
-    def generate_thumbnail_from_folder(self, folder_path, folder_name):
-        """从已修文件夹生成 400x400 缩略图"""
-        thumbnail_dir = os.path.join(os.getcwd(), "thumbnail")
-        os.makedirs(thumbnail_dir, exist_ok=True)
-
-        fixed_folder = os.path.join(folder_path, "已修")
-        if not os.path.exists(fixed_folder):
-            return ""
-
-        for file in os.listdir(fixed_folder):
-            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                image_path = os.path.join(fixed_folder, file)
-                try:
-                    img = Image.open(image_path).convert("RGBA")
-                    img = img.resize((400, 400), Image.Resampling.LANCZOS)
-                    save_path = os.path.join(thumbnail_dir, f"{folder_name}.png")
-                    img.save(save_path, "PNG")
-                    return save_path
-                except Exception as e:
-                    print(f"生成缩略图失败: {e}")
-                    return ""
-        return ""
   # -------------------- 以上为扫描逻辑 --------------------
 
     #搜索文件夹
     def filter_folders(self):
-        """根据搜索词过滤文件夹列表（匹配路径最后一级目录名，支持多关键字 OR）"""
+        """根据搜索词过滤虚拟列表文件夹（匹配路径最后一级目录名 + 备注，支持多关键字 OR）"""
         search_text = self.db_search_edit.text().lower().strip()
-        
-        # 按空格拆分多个关键字
         keywords = [kw for kw in search_text.split() if kw]
 
-        for i in range(self.folder_list.count()):
-            item = self.folder_list.item(i)
-            folder_path = item.data(Qt.UserRole)  # 获取完整路径
-            folder_last = os.path.basename(folder_path).lower()  # 提取最后一级目录名
+        if not keywords:
+            # 没输入关键字 → 显示全部
+            filtered_data = self.folders_data[:]
+        else:
+            # 匹配最后一级目录名或备注
+            filtered_data = []
+            for f in self.folders_data:
+                folder_last = os.path.basename(f.get('path', '')).lower()
+                remark = f.get('remark', '').lower()
+                if any(kw in folder_last or kw in remark for kw in keywords):
+                    filtered_data.append(f)
 
-            if not keywords:
-                # 没输入关键字 → 显示所有
-                item.setHidden(False)
-            else:
-                # 任意关键字匹配最后一级目录名就显示
-                matched = any(kw in folder_last for kw in keywords)
-                item.setHidden(not matched)
+        # 更新虚拟列表
+        self.folder_list.set_data(filtered_data)
+        self.total_num = len(filtered_data)
+        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
 
     #双击打开文件夹目录
-    def open_folder(self, item):
-        """双击打开文件夹"""
-        folder_path = item.data(Qt.UserRole)
+    def open_folder(self, index_or_data):
+        """
+        打开文件夹，可以传 index（int）或 data（dict）
+        """
+        # 如果传的是整数，则获取数据字典
+        if isinstance(index_or_data, int):
+            index = index_or_data
+            try:
+                data = self.folder_list.items_data[index]
+            except IndexError:
+                QMessageBox.warning(self, "警告", f"索引超出范围: {index}")
+                return
+        elif isinstance(index_or_data, dict):
+            data = index_or_data
+        else:
+            QMessageBox.warning(self, "警告", f"无效参数: {index_or_data}")
+            return
 
+        folder_path = data.get("path", "")
         if not os.path.exists(folder_path):
             QMessageBox.warning(self, "警告", f"文件夹不存在：{folder_path}")
             return
 
         try:
-            # 统一使用反斜杠路径
             normalized_path = folder_path.replace('/', '\\')
-
             system = platform.system()
             if system == "Windows":
-                # 使用 os.startfile 打开文件夹（不会闪 cmd 窗口）
                 try:
                     os.startfile(normalized_path)
-                except OSError as e:
-                    # 如果 os.startfile 打不开网络路径，尝试 Popen 方法
-                    try:
-                        subprocess.Popen(['explorer', normalized_path],
-                                        shell=False,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-                    except Exception as e2:
-                        QMessageBox.critical(self, "错误",
-                                            f"无法打开文件夹：{folder_path}\n错误: {str(e2)}")
-            elif system == "Darwin":  # macOS
+                except OSError:
+                    subprocess.Popen(
+                        ['explorer', normalized_path],
+                        shell=False,
+                        creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+            elif system == "Darwin":
                 subprocess.run(["open", normalized_path], check=True)
-            else:  # Linux
+            else:
                 subprocess.run(["xdg-open", normalized_path], check=True)
-
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开文件夹：{folder_path}\n错误: {str(e)}")
 
     #删除文件夹
-    def delete_folders(self, selected_items):
+    def delete_folders(self, selected_data_list):
+        """
+        删除虚拟列表中的文件夹记录及缩略图
+        selected_data_list: list[dict]，每个元素都是 folder_data
+        """
         try:
-            folder_count = len(selected_items)
-            folder_names = []
+            folder_count = len(selected_data_list)
+            if folder_count == 0:
+                return
 
-            # 弹出确认对话框时显示文件夹名称
+            # 收集文件夹名称用于提示
+            folder_names = [f.get("name", "未知文件夹") for f in selected_data_list]
+
+            # 弹出确认对话框
             reply = QMessageBox.question(
                 self,
                 "确认删除",
@@ -1651,41 +2687,32 @@ class FolderDatabaseApp(QMainWindow):
                 return  # 用户取消删除
 
             # 删除数据库记录
-            paths_to_delete = [item.data(Qt.UserRole) for item in selected_items]
-            self.folders_data = [f for f in self.folders_data if f['path'] not in paths_to_delete]
+            paths_to_delete = [f.get("path") for f in selected_data_list]
+            self.folders_data = [f for f in self.folders_data if f.get('path') not in paths_to_delete]
             self.save_database()
 
-            # 从列表中删除
-            for item in selected_items:
-                row = self.folder_list.row(item)
-                self.folder_list.takeItem(row)
+            # 删除虚拟列表中的记录
+            new_items_data = [f for f in self.folder_list.items_data if f.get("path") not in paths_to_delete]
+            self.folder_list.set_data(new_items_data)  # 重置虚拟列表数据
 
-            for item in selected_items:
-                folder_path = item.data(Qt.UserRole)
-                self.added_folder_paths.discard(folder_path)  # ✅ 从已添加集合中移除
+            # 删除缩略图
+            for f in selected_data_list:
+                thumb_path = f.get("thumbnail")
+                if thumb_path and os.path.exists(thumb_path):
+                    try:
+                        os.remove(thumb_path)
+                    except Exception as e:
+                        print(f"删除缩略图失败: {thumb_path} -> {e}")
+                self.added_folder_paths.discard(f.get("path"))
 
-            # 先收集所有文件夹名称
-            for item in selected_items:
-                folder_path = item.data(Qt.UserRole)
-                folder_record = next((f for f in self.folders_data if f['path'] == folder_path), None)
-                if folder_record:
-                    folder_names.append(folder_record['name'])
-                    # 删除缩略图
-                    thumb_path = folder_record.get('thumbnail')
-                    if thumb_path and os.path.exists(thumb_path):
-                        try:
-                            os.remove(thumb_path)
-                        except Exception as e:
-                            print(f"删除缩略图失败: {thumb_path} -> {e}")
-
-            self.status_label.setText(f"已从数据库删除 {folder_count} 个文件夹记录及其缩略图: {', '.join(folder_names)}")
+            # 更新状态栏
+            self.total_num = len(self.folder_list.items_data)
+            self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
             QMessageBox.information(
                 self,
                 "删除成功",
                 f"已删除 {folder_count} 个文件夹记录及其缩略图:\n" + "\n".join(folder_names)
             )
-            self.total_num = self.total_num - folder_count
-            self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
 
         except Exception as e:
             QMessageBox.critical(self, "删除失败", f"删除文件夹记录时发生错误：\n{str(e)}")
@@ -1710,51 +2737,86 @@ class FolderDatabaseApp(QMainWindow):
                             print(f"删除缩略图失败: {file} -> {e}")
 
             # 清空数据库
-            self.folders_data = []
-            self.folder_list.clear()
-            self.added_folder_paths.clear()  # 清空所有已添加路径集合
+            self.folders_data.clear()
+            self.added_folder_paths.clear()
+            self.folder_list.set_data([])
             self.save_database()
             self.status_label.setText("数据库已清空，所有缩略图已删除")
             QMessageBox.information(self, "完成", "数据库已清空，所有缩略图已删除！")
             self.total_num = 0
             self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
+
+    #刷新数据库
+    def refresh_folder_list(self):
+        """刷新文件夹列表"""
+        self.folder_list.set_data(self.folders_data[:])
+        self.save_database()
     
   # -------------------- 以下为加载数据库逻辑 --------------------
-    def add_folder_to_list_realtime(self, folder, current=0, total=0):
-        self.folders_data.append(folder)
-        name = folder.get('name', '未知文件夹')
-        path = folder.get('path', '')
-        thumbnail_path = folder.get('thumbnail', '')
-        note = folder.get('note', '')
+    def load_database(self):
+        """首次启动时加载数据库"""
+        if self.database_load_finished:
+            print("[load_database] 数据库已加载，跳过")
+            return
 
-        if path not in self.added_folder_paths:
-            self.added_folder_paths.add(path)
-            item = QListWidgetItem()
-            widget = FolderItemWidget(name, thumbnail_path, note)
-            item.setSizeHint(QSize(300, 89))
-            item.setData(Qt.UserRole, path)
-            item.setToolTip(f"{path}\n{note}" if note else path)
-            self.folder_list.addItem(item)
-            self.folder_list.setItemWidget(item, widget)
+        self.folders_data = []
+        self.added_folder_paths.clear()
+        # 注意：虚拟列表不需要clear()，因为没有实际的item
 
-        #动态计数更新状态栏
-        self.status_label.setText(f"正在加载 {name}（{current}/{total}）")
+        self.load_thread = LoadFoldersThread(self.database_file)
+        self.load_thread.batch_loaded.connect(self.add_folders_batch_realtime)
+        self.load_thread.load_finished.connect(self.on_load_finished)
+        self.load_thread.start()
+
+    def add_folders_batch_realtime(self, batch, current, total):
+        """批量更新虚拟列表"""
+        for folder in batch:
+            path = folder.get("path", "")
+            if path and path not in self.added_folder_paths:
+                self.folders_data.append(folder)
+                self.added_folder_paths.add(path)
+
+        # 更新总数
         self.total_num = total
+
+        # 刷新虚拟列表
+        self.folder_list.set_data(self.folders_data[:])
+        self.status_label.setText(f"正在收集数据 {current}/{total}")
+        QApplication.processEvents()
+
     def on_load_finished(self, total=0):
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
+        """数据库加载完成"""
+        # 最终更新虚拟列表
+        self.folder_list.set_data(self.folders_data[:])
+        
+        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
         self.database_load_finished = True
-        self.save_database()
+        # self.save_database()
+        
+        # 显示性能统计
+        stats = self.folder_list.get_performance_stats()
+        print(f"[性能统计] 渲染次数: {stats['render_count']}, 缓存命中: {stats['cache_hits']}")
   # -------------------- 以上为加载数据库逻辑 --------------------
 
     #保存数据库
     def save_database(self):
-        """保存数据库到JSON文件"""
+        """保存数据库到JSON文件，并更新列表项ToolTip"""
         try:
+            for index, folder_data in enumerate(self.folders_data):
+                remark = folder_data.get('remark', '')
+                path = folder_data.get('path', '')
+
+                # 如果当前 widget 可见，更新它的 ToolTip
+                widget = self.folder_list.visible_widgets.get(index)
+                if widget:
+                    widget.setToolTip(f"{path}\n{remark}" if remark else path)
+
+            # 保存数据库到 JSON 文件
             with open(self.database_file, 'w', encoding='utf-8') as f:
                 json.dump(self.folders_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存数据库失败：{str(e)}\n请以管理员身份运行此程序！")
-    
+
     #加载配置文件
     def load_config(self):
         """加载配置文件"""
@@ -1795,7 +2857,6 @@ class FolderDatabaseApp(QMainWindow):
         self.save_database()
         self.save_config()
         event.accept()
-
 
 def main():
     app = QApplication(sys.argv)
