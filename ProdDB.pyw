@@ -6,16 +6,411 @@ import platform
 import shutil
 import pandas as pd
 import zipfile
+import subprocess
+import sys
+import time
+import zipfile
+import tempfile   
+import subprocess
+import shutil
+import requests
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageFile
+from datetime import datetime
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
+CURRENT_VERSION = "v1.0.3" #版本号
 
 
+        
+#---------------子线程 检查更新----------------------------------
+class CheckUpdateThread(QThread):
+    update_checked = pyqtSignal(dict, str)  # 传递检查结果和错误信息
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version
+        self.api_url = "https://api.github.com/repos/lemon-o/ProdDB/releases/latest"
+
+    def run(self):
+        try:
+            response = requests.get(self.api_url, timeout=10)
+            response.raise_for_status()
+            self.update_checked.emit(response.json(), "")
+        except Exception as e:
+            self.update_checked.emit({}, str(e))
+
+# 检测更新窗口
+class UpdateDialog(QDialog):
+    def __init__(self, parent=None, current_version=""):
+        super().__init__(parent)
+        self.current_version = current_version
+        self.latest_version = ""
+        self.download_url = ""
+        self.setup_ui()
+        self.show()  # 立即显示窗口
+        self.start_check_update()  # 使用专用线程检查更新
+        
+    def setup_ui(self):
+        self.setWindowTitle("检查更新")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.resize(400, 150)
+        
+        layout = QVBoxLayout()
+        
+        # 标题
+        title_label = QLabel("软件更新")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        
+        # 状态信息
+        self.status_label = QLabel("正在检查更新...")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                padding: 10px;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                background-color: #f8f9fa;
+                min-height: 40px;
+            }
+        """)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+        
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()  # 初始隐藏
+        layout.addWidget(self.progress_bar)
+        
+        # 按钮布局 - 只在检查更新窗口显示
+        button_height1 = self.height() // 5
+        button_style = """
+        QPushButton {
+            background-color: #ffffff;
+            color: #3b3b3b;
+            border-radius: 6%; /* 圆角半径使用相对单位，可以根据需要调整 */
+            border: 1px solid #f5f5f5;
+        }
+
+        QPushButton:hover {
+            background-color: #0773fc;
+            color: #ffffff;
+            border: 0.1em solid #0773fc; /* em为相对单位 */
+        }
+
+        QPushButton:disabled {
+            background-color: #f0f0f0;  /* 禁用时的背景色（浅灰色） */
+            color: #a0a0a0;           /* 禁用时的文字颜色（灰色） */
+            border: 1px solid #d0d0d0; /* 禁用时的边框颜色 */
+        }
+        """
+        self.button_layout = QHBoxLayout()
+        self.update_button = QPushButton("更新")
+        self.update_button.setFixedHeight(button_height1)
+        self.update_button.setStyleSheet(button_style)
+        self.update_button.clicked.connect(self.start_update)
+        self.update_button.setEnabled(False)  # 初始不可用
+        self.button_layout.addWidget(self.update_button)
+        
+        self.cancel_button = QPushButton("取消")
+        self.cancel_button.setFixedHeight(button_height1)
+        self.cancel_button.setStyleSheet(button_style)
+        self.cancel_button.clicked.connect(self.close)
+        self.button_layout.addWidget(self.cancel_button)
+        
+        layout.addLayout(self.button_layout)
+        self.setLayout(layout)
+        
+    def start_check_update(self):
+        """启动异步检查更新"""
+        self.status_label.setText("正在检查更新...")
+        self.check_thread = CheckUpdateThread(self.current_version)
+        self.check_thread.update_checked.connect(self.handle_update_result)
+        self.check_thread.start()
+
+    def handle_update_result(self, release_info, error):
+        """处理检查结果"""
+        if error:
+            self.status_label.setText(f"检查失败: {error}")
+            self.cancel_button.setText("关闭")
+            return
+
+        # 解析版本信息
+        self.latest_version = release_info.get("tag_name", "")
+        if not self.latest_version:
+            self.status_label.setText("无法获取版本号")
+            self.cancel_button.setText("关闭")
+            return
+
+        self.status_label.setText(f"当前版本: {self.current_version}\n最新版本: {self.latest_version}")
+
+        if self.latest_version == self.current_version:
+            self.status_label.setText("已经是最新版本")
+            self.cancel_button.setText("关闭")
+            return
+
+        # 获取下载链接
+        assets = release_info.get("assets", [])
+        for asset in assets:
+            name = asset.get("name", "").lower()
+            if name.endswith((".exe", ".zip")):
+                self.download_url = asset.get("browser_download_url")
+                break
+
+        if not self.download_url:
+            self.status_label.setText("未找到可下载的安装文件")
+            self.cancel_button.setText("关闭")
+            return
+
+        # 发现新版本，启用更新按钮
+        self.status_label.setText(f"发现新版本 {self.latest_version}，当前版本{CURRENT_VERSION}")
+        self.update_button.setEnabled(True)
+
+    def start_update(self):
+        """开始下载更新"""
+        if hasattr(self, 'download_url') and self.download_url:
+            # 重置UI状态
+            self.update_button.hide()
+            self.cancel_button.hide()
+            self.progress_bar.show()
+            self.progress_bar.setValue(0)
+            self.status_label.setText("准备下载更新...")
+            
+            # 强制立即更新UI
+            QApplication.processEvents()
+            
+            # 创建下载线程
+            self.download_thread = DownloadThread(self.download_url)
+            
+            # 正确连接所有信号
+            self.download_thread.download_progress.connect(self.handle_download_progress)
+            self.download_thread.download_finished.connect(self.on_download_finished)
+            self.download_thread.download_failed.connect(self.on_download_failed)
+            self.download_thread.message.connect(self.status_label.setText)
+            
+            self.download_thread.start()
+
+    def handle_download_progress(self, progress, downloaded_size, speed_str):
+        """处理下载进度和网速"""
+        # 格式化大小显示
+        def format_size(size):
+            if size < 1024:
+                return f"{size}B"
+            elif size < 1024 * 1024:
+                return f"{size/1024:.1f}KB"
+            else:
+                return f"{size/(1024 * 1024):.1f}MB"
+        
+        # 更新UI
+        total_size = self.download_thread.total_size
+        total_str = format_size(total_size) if total_size > 0 else "未知大小"
+        
+        self.progress_bar.setValue(progress)
+        self.status_label.setText(
+            f"正在下载更新({format_size(downloaded_size)}/{total_str}) | 速度: {speed_str}"
+        )
+        QApplication.processEvents()
+
+    def on_download_failed(self, error_msg):
+        """下载失败处理"""
+        self.progress_bar.hide()
+        self.status_label.setText(f"下载失败: {error_msg}")
+        # 只显示关闭按钮
+        self.cancel_button.setText("关闭")
+        self.cancel_button.show()
+
+    def on_download_finished(self, local_path):
+        """下载完成处理"""
+        self.status_label.setText("下载完成，准备安装...")
+        self.progress_bar.setValue(100)
+        
+        try:
+            if local_path.endswith(".exe"):
+                # 最小化所有窗口并启动安装程序
+                self.minimize_all_windows()
+                subprocess.Popen(
+                    [local_path], 
+                    shell=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )     
+                print(local_path)    
+                
+            elif local_path.endswith(".zip"):
+                self.status_label.setText(f"更新包已下载到: {local_path}")
+                # 只显示关闭按钮
+                self.cancel_button.setText("关闭")
+                self.cancel_button.show()
+                
+        except Exception as e:
+            self.status_label.setText(f"安装失败: {e}")
+            # 只显示关闭按钮
+            self.cancel_button.setText("关闭")
+            self.cancel_button.show()
+
+    def minimize_all_windows(self):
+        """最小化主窗口和所有子窗口"""
+        # 最小化主窗口
+        if self.parent():
+            self.parent().showMinimized()
+        
+        # 最小化所有对话框
+        for window in QApplication.topLevelWidgets():
+            if window.isWindow() and window.isVisible():
+                window.showMinimized()
+
+        # 退出当前实例
+        QApplication.quit()
+
+#-----------子线程 下载更新--------------------------------------------
+class DownloadThread(QThread):
+    download_progress = pyqtSignal(int, int, str)  # 进度, 已下载大小, 网速字符串
+    download_finished = pyqtSignal(str)
+    download_failed = pyqtSignal(str)
+    message = pyqtSignal(str)
+    
+    def __init__(self, download_url):
+        super().__init__()
+        self.download_url = download_url
+        self.total_size = 0
+        self._is_running = True
+        self._start_time = None
+        self._last_update_time = None
+        self._last_size = 0
+        self._speed_history = []
+
+    def run(self):
+        try:
+            tmp_dir = tempfile.mkdtemp()
+            local_path = os.path.join(tmp_dir, os.path.basename(self.download_url))
+            
+            self.message.emit(f"开始下载: {os.path.basename(self.download_url)}")
+            self._start_time = time.time()
+            self._last_update_time = self._start_time
+            self._last_size = 0
+            
+            with requests.get(self.download_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                self.total_size = int(r.headers.get('content-length', 0))
+                downloaded_size = 0
+                
+                with open(local_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if not self._is_running:
+                            os.remove(local_path)
+                            self.message.emit("下载已取消")
+                            return
+                            
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+                        # 计算实时网速（每100ms更新一次）
+                        current_time = time.time()
+                        if current_time - self._last_update_time >= 0.1:  # 100ms更新频率
+                            elapsed = current_time - self._last_update_time
+                            speed = (downloaded_size - self._last_size) / elapsed  # B/s
+                            
+                            # 平滑处理（最近3次平均值）
+                            self._speed_history.append(speed)
+                            if len(self._speed_history) > 3:
+                                self._speed_history.pop(0)
+                            avg_speed = sum(self._speed_history) / len(self._speed_history)
+                            
+                            # 格式化网速显示
+                            speed_str = self.format_speed(avg_speed)
+                            
+                            progress = int(downloaded_size * 100 / self.total_size) if self.total_size > 0 else 0
+                            self.download_progress.emit(progress, downloaded_size, speed_str)
+                            
+                            self._last_update_time = current_time
+                            self._last_size = downloaded_size
+                
+            self.download_finished.emit(local_path)
+            
+        except Exception as e:
+            self.download_failed.emit(str(e))
+    
+    def format_speed(self, speed_bps):
+        """格式化网速显示"""
+        if speed_bps < 1024:  # <1KB/s
+            return f"{speed_bps:.0f} B/s"
+        elif speed_bps < 1024 * 1024:  # <1MB/s
+            return f"{speed_bps/1024:.1f} KB/s"
+        else:
+            return f"{speed_bps/(1024 * 1024):.1f} MB/s"
+
+#--------------自定义QLineEdit右键菜单----------------------------
+class ChineseLineEdit(QLineEdit):
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+
+        undo_action = QAction("撤销", self)
+        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
+        undo_action.setShortcutVisibleInContextMenu(True)
+        undo_action.triggered.connect(self.undo)
+        menu.addAction(undo_action)
+
+        redo_action = QAction("重做", self)
+        redo_action.setShortcut(QKeySequence("Ctrl+Y"))
+        redo_action.setShortcutVisibleInContextMenu(True)
+        redo_action.triggered.connect(self.redo)
+        menu.addAction(redo_action)
+
+        menu.addSeparator()
+
+        cut_action = QAction("剪切", self)
+        cut_action.setShortcut(QKeySequence("Ctrl+X"))
+        cut_action.setShortcutVisibleInContextMenu(True)
+        cut_action.triggered.connect(self.cut)
+        menu.addAction(cut_action)
+
+        copy_action = QAction("复制", self)
+        copy_action.setShortcut(QKeySequence("Ctrl+C"))
+        copy_action.setShortcutVisibleInContextMenu(True)
+        copy_action.triggered.connect(self.copy)
+        menu.addAction(copy_action)
+
+        paste_action = QAction("粘贴", self)
+        paste_action.setShortcut(QKeySequence("Ctrl+V"))
+        paste_action.setShortcutVisibleInContextMenu(True)
+        paste_action.triggered.connect(self.paste)
+        menu.addAction(paste_action)
+
+        delete_action = QAction("删除", self)
+        delete_action.setShortcut(QKeySequence("Del"))
+        delete_action.setShortcutVisibleInContextMenu(True)
+        delete_action.triggered.connect(lambda: self.del_selected_text())
+        menu.addAction(delete_action)
+
+        menu.addSeparator()
+
+        select_all_action = QAction("全选", self)
+        select_all_action.setShortcut(QKeySequence("Ctrl+A"))
+        select_all_action.setShortcutVisibleInContextMenu(True)
+        select_all_action.triggered.connect(self.selectAll)
+        menu.addAction(select_all_action)
+
+        menu.exec_(event.globalPos())
+
+    def del_selected_text(self):
+        cursor = self.cursorPosition()
+        selected_text = self.selectedText()
+        if selected_text:
+            text = self.text()
+            start = self.selectionStart()
+            self.setText(text[:start] + text[start+len(selected_text):])
+            self.setCursorPosition(start)
+
+#----------菜单项样式---------------------------------------------        
 class RoundMenu(QMenu):
     def __init__(self, title="", parent=None):
         super().__init__(title, parent)
@@ -70,25 +465,37 @@ class RoundMenu(QMenu):
         return sh
 
 # ---------------- 子线程 导入产品信息----------------
+
 class ImportProductThread(QThread):
     progress_changed = pyqtSignal(int, str)  # 百分比 + 当前处理的文件夹名
-    finished = pyqtSignal(int, int)          # 更新数量、跳过数量
+    finished = pyqtSignal(int, int, bool)    # 更新数量、跳过数量、是否被取消
 
     def __init__(self, folders_data, excel_path):
         super().__init__()
         self.folders_data = folders_data
         self.excel_path = excel_path
+        self.should_stop = False  # 取消标志
+
+    def stop_processing(self):
+        """停止处理"""
+        self.should_stop = True
 
     def run(self):
         updated_count = 0
         skipped_count = 0
+        was_cancelled = False
 
         try:
+            # 检查是否在开始前就被取消
+            if self.should_stop:
+                self.finished.emit(0, 0, True)
+                return
+
             # 明确指定列名读取，跳过第一行标题
             df = pd.read_excel(self.excel_path, header=0, names=["name", "_", "remark"])
         except Exception as e:
             print(f"读取Excel失败: {e}")
-            self.finished.emit(0, 0)
+            self.finished.emit(0, 0, False)
             return
 
         # 用 name 作为索引（self.folders_data 中已有）
@@ -96,13 +503,21 @@ class ImportProductThread(QThread):
 
         # 获取A列非空数据（排除空值）
         valid_rows = df[~df["name"].isna() & df["name"].astype(str).str.strip().ne("")]
-        total_names = len(valid_rows) # 有效name总数（已排除空值）
+        total_names = len(valid_rows)  # 有效name总数（已排除空值）
 
         if total_names == 0:
-            self.finished.emit(0, 0)
+            self.finished.emit(0, 0, False)
             return
 
+        # 初始进度设置为3%
+        self.progress_changed.emit(3, "开始处理...")
+
         for i, (idx, row) in enumerate(valid_rows.iterrows()):
+            # 检查是否需要停止
+            if self.should_stop:
+                was_cancelled = True
+                break
+
             name = str(row["name"]).strip()
             remark = str(row["remark"]).strip() if not pd.isna(row["remark"]) else ""
 
@@ -117,6 +532,11 @@ class ImportProductThread(QThread):
                 folder_name = item.get("name", "未知文件夹")
                 if folder_path:
                     try:
+                        # 再次检查是否需要停止（在文件操作前）
+                        if self.should_stop:
+                            was_cancelled = True
+                            break
+
                         fixed_folder_path = os.path.join(folder_path, "已修")
                         os.makedirs(fixed_folder_path, exist_ok=True)
                         safe_name = "".join(c for c in folder_name if c not in "\\/:*?\"<>|")
@@ -137,12 +557,21 @@ class ImportProductThread(QThread):
             else:
                 skipped_count += 1
 
-            # 更新进度
-            percent = int((i + 1) / total_names * 100)
+            # 更新进度 - 从3%开始到100%
+            start_percent = 3
+            end_percent = 100
+            progress_range = end_percent - start_percent
+
+            percent = int(start_percent + ((i + 1) / total_names * progress_range))
             self.progress_changed.emit(percent, name)
 
+        # 如果没有被取消，确保进度达到100%
+        if not was_cancelled:
+            self.progress_changed.emit(100, "处理完成")
+
         # 完成时发射信号
-        self.finished.emit(updated_count, skipped_count)
+        self.finished.emit(updated_count, skipped_count, was_cancelled)
+
 # -------------------- 子线程 生成原图证明文件 --------------------
 class ZipGeneratorThread(QThread):
     """压缩包生成线程"""
@@ -162,6 +591,7 @@ class ZipGeneratorThread(QThread):
         self.temp_dir = temp_dir  # 使用指定的临时目录
         self.results = []
         self.should_stop = False  # 停止标志
+        self.last_progress = 3  # 记录上次发送的进度，初始为3%
     
     def stop_processing(self):
         """停止压缩处理"""
@@ -170,6 +600,9 @@ class ZipGeneratorThread(QThread):
     def run(self):
         """在后台线程中生成压缩包"""
         total_tasks = len(self.folders_data)
+        
+        # 初始化进度为3%
+        self.progress_updated.emit(3)
         
         for i, (folder_name, folder_path) in enumerate(self.folders_data):
             if self.should_stop:
@@ -206,13 +639,10 @@ class ZipGeneratorThread(QThread):
                 # 发送错误状态的进度文本
                 current_index = i + 1
                 self.progress_text_updated.emit(current_index, total_tasks, folder_name, f"处理失败: {error_msg}")
-            
-            if not self.should_stop:
-                # 任务完成后的进度更新
-                progress = int((i + 1) * 100 / total_tasks)
-                self.progress_updated.emit(progress)
         
         if not self.should_stop:
+            # 所有任务完成，设置进度为100%
+            self.progress_updated.emit(100)
             self.all_completed.emit(self.results)
     
     def create_single_zip_with_progress(self, folder_name, folder_path, zip_path, task_index, total_tasks):
@@ -223,7 +653,7 @@ class ZipGeneratorThread(QThread):
         try:
             current_index = task_index + 1
             
-            # 步骤1: 统计文件数量（占总进度的5%）
+            # 步骤1: 统计文件数量（占当前任务的5%）
             self.current_task.emit("统计文件", f"统计 {folder_name} 中的文件数量...")
             self.progress_text_updated.emit(current_index, total_tasks, folder_name, "统计文件数量")
             total_files = self.count_files_in_directory(folder_path)
@@ -236,7 +666,7 @@ class ZipGeneratorThread(QThread):
             temp_folder_path = work_dir
             os.makedirs(temp_folder_path, exist_ok=True)
 
-            # 步骤2: 复制子文件夹（占总进度的20%）
+            # 步骤2: 复制子文件夹（占当前任务的20%）
             self.current_task.emit("复制文件", f"复制 {folder_name} 的子文件夹...")
             self.progress_text_updated.emit(current_index, total_tasks, folder_name, "复制子文件夹")
             self.copy_subfolders_only_with_progress(folder_path, temp_folder_path, task_index, total_tasks, 0.05, 0.25)
@@ -244,7 +674,7 @@ class ZipGeneratorThread(QThread):
             if self.should_stop:
                 return
 
-            # 步骤3: 复制声明文件（占总进度的5%）
+            # 步骤3: 复制声明文件（占当前任务的5%）
             self.current_task.emit("复制声明", f"复制原图声明文件...")
             self.progress_text_updated.emit(current_index, total_tasks, folder_name, "复制声明文件")
             proof_filename = os.path.basename(self.proof_file_path)
@@ -255,7 +685,7 @@ class ZipGeneratorThread(QThread):
             if self.should_stop:
                 return
 
-            # 步骤4: 压缩文件（占总进度的70%）
+            # 步骤4: 压缩文件（占当前任务的70%）
             self.current_task.emit("压缩文件", f"正在压缩 {folder_name}...")
             self.progress_text_updated.emit(current_index, total_tasks, folder_name, "正在压缩")
             self.create_zip_file_with_progress(work_dir, zip_path, folder_name, task_index, total_tasks, 0.3, 1.0, total_files)
@@ -310,7 +740,6 @@ class ZipGeneratorThread(QThread):
         """创建压缩包文件，包含完整的文件夹结构，并提供进度反馈"""
         try:
             processed_files = 0
-            last_progress = -1
             
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
                 for root, dirs, files in os.walk(source_folder):
@@ -332,16 +761,12 @@ class ZipGeneratorThread(QThread):
                             zipf.write(file_path, arcname)
                             processed_files += 1
                             
-                            # 计算压缩进度
-                            if estimated_files > 0:
-                                file_progress = min(processed_files / estimated_files, 1.0)
-                                current_progress = start_progress + (end_progress - start_progress) * file_progress
-                                
-                                # 只在进度有明显变化时更新（避免过于频繁）
-                                progress_int = int(current_progress * 100)
-                                if progress_int != last_progress:
+                            # 计算压缩进度，每处理10个文件更新一次进度
+                            if processed_files % 10 == 0 or processed_files == estimated_files:
+                                if estimated_files > 0:
+                                    file_progress = min(processed_files / estimated_files, 1.0)
+                                    current_progress = start_progress + (end_progress - start_progress) * file_progress
                                     self.update_task_progress(task_index, total_tasks, current_progress)
-                                    last_progress = progress_int
                                     
                         except Exception as e_file:
                             print(f"压缩文件出错: {file_path} -> {str(e_file)}")
@@ -362,7 +787,7 @@ class ZipGeneratorThread(QThread):
                             print(f"压缩空文件夹出错: {folder_arcname} -> {str(e_folder)}")
                             raise Exception(f"压缩空文件夹出错: {folder_arcname} -> {str(e_folder)}")
             
-            # 确保压缩完成时进度达到100%
+            # 确保压缩完成时进度达到当前任务的结束进度
             if not self.should_stop:
                 self.update_task_progress(task_index, total_tasks, end_progress)
                 
@@ -370,18 +795,27 @@ class ZipGeneratorThread(QThread):
             raise Exception(f"创建压缩包时出错: {str(e)}")
     
     def update_task_progress(self, task_index, total_tasks, task_progress):
-        """更新任务进度"""
+        """更新任务进度 - 确保进度单调递增"""
         if self.should_stop:
             return
             
-        # 计算总体进度
-        base_progress = task_index / total_tasks
-        current_task_contribution = task_progress / total_tasks
-        overall_progress = int((base_progress + current_task_contribution) * 100)
+        # 计算总体进度：从3%开始，到100%结束
+        start_percent = 3
+        end_percent = 100
+        progress_range = end_percent - start_percent
         
-        # 确保进度在合理范围内
-        overall_progress = max(0, min(100, overall_progress))
-        self.progress_updated.emit(overall_progress)
+        # 每个任务在总进度中占用的比例
+        task_weight = progress_range / total_tasks
+        
+        # 计算当前总体进度
+        base_progress = task_index * task_weight  # 前面已完成任务的进度
+        current_task_progress = task_progress * task_weight  # 当前任务的进度
+        overall_progress = int(start_percent + base_progress + current_task_progress)
+        
+        # 确保进度单调递增，不会出现跳动
+        if overall_progress > self.last_progress:
+            self.last_progress = overall_progress
+            self.progress_updated.emit(overall_progress)
     
     def create_single_zip(self, folder_name, folder_path, zip_path):
         """创建单个压缩包（保持向后兼容）"""
@@ -397,11 +831,11 @@ class ZipGeneratorThread(QThread):
         estimated_files = self.count_files_in_directory(source_folder)
         self.create_zip_file_with_progress(source_folder, zip_path, folder_name, 0, 1, 0, 1, estimated_files)
 
-# -------------------- 子线程 扫描文件夹 --------------------
 class FolderScanner(QThread):
-    folder_found = pyqtSignal(str, str, str, str)  
-    scan_finished = pyqtSignal(int, int)      
-    update_status = pyqtSignal(str)          
+    folder_found = pyqtSignal(str, str, str, str, str, str)  # name, path, thumb, remark, add_date, modify_date
+    scan_finished = pyqtSignal(int, int)
+    update_status = pyqtSignal(str)
+
     def __init__(self, root_path, search_term, added_paths=None):
         super().__init__()
         self.root_path = root_path
@@ -420,34 +854,26 @@ class FolderScanner(QThread):
             for item in os.listdir(path):
                 item_path = os.path.join(path, item).replace('/', '\\')
                 if os.path.isdir(item_path):
-                    # 实时更新状态
+                    folder_name = os.path.basename(item_path)
                     self.update_status.emit(
-                        f"扫描中：{item_path}\n已写入：{self.found_count} 个，已跳过：{self.skipped_count} 个"
+                        f"<span style='color: #ffdb29;'>●</span> 扫描中：{folder_name}（已写入：{self.found_count} 个 / 已跳过：{self.skipped_count} 个）"
                     )
 
-                    # 已添加路径跳过
                     if item_path in self.added_paths:
                         self.skipped_count += 1
                         continue
 
-                    # 匹配关键词
-                    # 将搜索词按空格分割成多个关键词
                     search_terms = self.search_term.split()
-
-                    # 检查是否有任何关键词匹配（或关系）
                     if any(term.lower() in item.lower() for term in search_terms):
                         if item_path not in self.scanned_paths:
                             self.scanned_paths.add(item_path)
 
-                            # 只扫描匹配文件夹里的 "已修" 子文件夹
                             fixed_folder = os.path.join(item_path, "已修")
                             thumbnail_path = ""
-                            remark = ""  # 新增备注字段
-                            if os.path.exists(fixed_folder):
-                                # 生成缩略图（如果有图片）
-                                thumbnail_path = self._generate_thumbnail(item_path, item)
+                            remark = ""
 
-                                # 尝试读取产品信息 JSON
+                            if os.path.exists(fixed_folder):
+                                thumbnail_path = self._generate_thumbnail(item_path, item)
                                 safe_name = "".join(c for c in item if c not in "\\/:*?\"<>|")
                                 json_file_path = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
                                 if os.path.exists(json_file_path):
@@ -458,24 +884,27 @@ class FolderScanner(QThread):
                                     except Exception:
                                         remark = ""
 
+                            # 计算添加日期和修改日期
+                            add_timestamp = os.path.getctime(item_path)
+                            modify_timestamp = os.path.getmtime(item_path)
+                            add_date = datetime.fromtimestamp(add_timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                            modify_date = datetime.fromtimestamp(modify_timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
                             # 发射信号
-                            self.folder_found.emit(item, item_path, thumbnail_path, remark)
+                            self.folder_found.emit(item, item_path, thumbnail_path, remark, add_date, modify_date)
                             self.found_count += 1
 
-                        # 不再递归扫描子目录
                         continue
 
-                    # 如果不是匹配文件夹，继续递归扫描子目录
                     self._scan_directory(item_path)
 
         except (PermissionError, OSError):
             pass
 
     def _generate_thumbnail(self, folder_path, folder_name):
-        """生成 400x400 缩略图"""
+        from PIL import Image
         thumbnail_dir = os.path.join(os.getcwd(), "thumbnail")
         os.makedirs(thumbnail_dir, exist_ok=True)
-
         fixed_folder = os.path.join(folder_path, "已修")
         if not os.path.exists(fixed_folder):
             return ""
@@ -501,18 +930,241 @@ class ClickableLabel(QLabel):
         self.clicked.emit()
 
 # ------------------ 预览窗口 ------------------
+class NavigationButton(QPushButton):
+    def __init__(self, direction, parent=None):
+        super().__init__(parent)
+        self.direction = direction  # 'left' or 'right'
+        self.setFixedSize(40, 60)  # 改小按钮尺寸
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 100);
+                border: none;
+                border-radius: 6px;
+                color: white;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 150);
+            }
+            QPushButton:pressed {
+                background-color: rgba(0, 0, 0, 200);
+            }
+        """)
+        
+        # 设置箭头文字
+        if direction == 'left':
+            self.setText('‹')
+        else:
+            self.setText('›')
+        
+        # 初始隐藏
+        self.hide()
+
 class ZoomableLabel(QLabel):
+    # 添加切换图片的信号
+    imageChanged = pyqtSignal(str)  # 发送当前图片路径
+    
     def __init__(self, image_path):
         super().__init__()
+        self.current_image_path = image_path
+        self.image_list = []
+        self.current_index = 0
+        
+        # 获取同目录下的所有图片文件
+        self._load_image_list()
+        
         self.pixmap_orig = QPixmap(image_path)
         self.setPixmap(self.pixmap_orig)
         self.setAlignment(Qt.AlignCenter)
         self.scale_factor = 1.0
-        self.offset = QPoint(0, 0)  # 图片相对于 QLabel 的偏移，用于拖动
+        self.offset = QPoint(0, 0)
         self.last_pos = None
         self.setMouseTracking(True)
         self.setMinimumSize(1, 1)
-
+        
+        # 创建左右导航按钮
+        self.left_button = NavigationButton('left', self)
+        self.right_button = NavigationButton('right', self)
+        
+        # 连接按钮信号
+        self.left_button.clicked.connect(self.prev_image)
+        self.right_button.clicked.connect(self.next_image)
+        
+        # 创建定时器用于隐藏按钮
+        self.hide_timer = QTimer()
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.hide_buttons)
+        self.hide_delay = 2000  # 2秒后隐藏
+        
+        # 按钮显示区域的偏移距离
+        self.button_area_offset = 30  # 按钮周围30像素范围内都会显示按钮
+    
+    def _load_image_list(self):
+        """加载同目录下的所有图片文件"""
+        if not os.path.exists(self.current_image_path):
+            return
+            
+        image_dir = os.path.dirname(self.current_image_path)
+        image_name = os.path.basename(self.current_image_path)
+        
+        # 支持的图片格式
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
+        
+        try:
+            all_files = os.listdir(image_dir)
+            # 筛选图片文件并排序
+            self.image_list = sorted([
+                f for f in all_files 
+                if os.path.splitext(f.lower())[1] in image_extensions
+            ])
+            
+            # 找到当前图片的索引
+            if image_name in self.image_list:
+                self.current_index = self.image_list.index(image_name)
+        except Exception as e:
+            print(f"加载图片列表时出错: {e}")
+    
+    def load_image(self, image_path):
+        """加载新图片"""
+        if os.path.exists(image_path):
+            # 记录当前鼠标位置
+            current_mouse_pos = self.mapFromGlobal(QCursor.pos())
+            
+            self.current_image_path = image_path
+            self.pixmap_orig = QPixmap(image_path)
+            # 重置缩放和偏移
+            self.scale_factor = 1.0
+            self.offset = QPoint(0, 0)
+            self.update_pixmap()
+            # 发送图片改变信号
+            self.imageChanged.emit(image_path)
+            
+            # 延迟检查鼠标位置，确保按钮位置已更新
+            QTimer.singleShot(50, lambda: self.check_mouse_in_button_area(current_mouse_pos))
+    
+    def prev_image(self):
+        """切换到上一张图片"""
+        if len(self.image_list) <= 1:
+            return
+        
+        # 记录按钮点击，暂时停止隐藏定时器
+        self.hide_timer.stop()
+        
+        self.current_index = (self.current_index - 1) % len(self.image_list)
+        image_dir = os.path.dirname(self.current_image_path)
+        new_path = os.path.join(image_dir, self.image_list[self.current_index])
+        self.load_image(new_path)
+    
+    def next_image(self):
+        """切换到下一张图片"""
+        if len(self.image_list) <= 1:
+            return
+        
+        # 记录按钮点击，暂时停止隐藏定时器
+        self.hide_timer.stop()
+        
+        self.current_index = (self.current_index + 1) % len(self.image_list)
+        image_dir = os.path.dirname(self.current_image_path)
+        new_path = os.path.join(image_dir, self.image_list[self.current_index])
+        self.load_image(new_path)
+    
+    def show_buttons(self):
+        """显示导航按钮"""
+        if len(self.image_list) > 1:  # 只有多张图片时才显示按钮
+            self.left_button.show()
+            self.right_button.show()
+        
+        # 停止隐藏定时器
+        self.hide_timer.stop()
+    
+    def hide_buttons(self):
+        """隐藏导航按钮"""
+        self.left_button.hide()
+        self.right_button.hide()
+    
+    def check_mouse_in_button_area(self, mouse_pos=None):
+        """检查鼠标是否在按钮区域内并相应显示/隐藏按钮"""
+        if mouse_pos is None:
+            mouse_pos = self.mapFromGlobal(QCursor.pos())
+        
+        if self.is_mouse_in_button_area(mouse_pos):
+            self.show_buttons()
+        else:
+            # 如果不在按钮区域，启动隐藏定时器
+            if not self.hide_timer.isActive():
+                self.hide_timer.start(500)
+    
+    def update_button_positions(self):
+        """更新按钮位置"""
+        # 左按钮位置
+        self.left_button.move(15, (self.height() - self.left_button.height()) // 2)
+        # 右按钮位置
+        self.right_button.move(
+            self.width() - self.right_button.width() - 15,
+            (self.height() - self.right_button.height()) // 2
+        )
+        
+        # 按钮位置更新后，检查鼠标是否仍在按钮区域
+        if self.underMouse():  # 只有当鼠标在widget内才检查
+            self.check_mouse_in_button_area()
+    
+    def resizeEvent(self, event):
+        """窗口大小改变时更新按钮位置"""
+        super().resizeEvent(event)
+        self.update_button_positions()
+        self.update_pixmap()
+    
+    def get_button_detection_rects(self):
+        """获取按钮检测区域（按钮周围扩展一定范围）"""
+        left_btn_rect = self.left_button.geometry()
+        right_btn_rect = self.right_button.geometry()
+        
+        # 扩展检测区域
+        offset = self.button_area_offset
+        left_detection_rect = left_btn_rect.adjusted(-offset, -offset, offset, offset)
+        right_detection_rect = right_btn_rect.adjusted(-offset, -offset, offset, offset)
+        
+        return left_detection_rect, right_detection_rect
+    
+    def is_mouse_in_button_area(self, pos):
+        """检查鼠标是否在按钮检测区域内"""
+        left_rect, right_rect = self.get_button_detection_rects()
+        return left_rect.contains(pos) or right_rect.contains(pos)
+    
+    def enterEvent(self, event):
+        """鼠标进入时检查是否在按钮区域"""
+        super().enterEvent(event)
+        # 不再自动显示按钮，只有在按钮区域内才显示
+    
+    def leaveEvent(self, event):
+        """鼠标离开时隐藏按钮"""
+        super().leaveEvent(event)
+        self.hide_timer.start(200)  # 0.2秒后隐藏
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动时的处理"""
+        mouse_pos = event.pos()
+        
+        # 检查鼠标是否在按钮检测区域并更新按钮状态
+        self.check_mouse_in_button_area(mouse_pos)
+        
+        # 原有的拖拽功能
+        if self.last_pos is not None:
+            delta = event.pos() - self.last_pos
+            self.offset += delta
+            self.last_pos = event.pos()
+            self.update_pixmap()
+    
+    def keyPressEvent(self, event):
+        """键盘事件：支持左右箭头键和空格键切换"""
+        if event.key() == Qt.Key_Left or event.key() == Qt.Key_A:
+            self.prev_image()
+        elif event.key() == Qt.Key_Right or event.key() == Qt.Key_D or event.key() == Qt.Key_Space:
+            self.next_image()
+        else:
+            super().keyPressEvent(event)
+    
     def wheelEvent(self, event):
         # 鼠标滚轮缩放
         delta = event.angleDelta().y()
@@ -521,7 +1173,6 @@ class ZoomableLabel(QLabel):
             self.scale_factor *= 1.1
         else:
             self.scale_factor *= 0.9
-
         # 限制缩放比例
         self.scale_factor = max(0.1, min(self.scale_factor, 5.0))
         
@@ -531,20 +1182,11 @@ class ZoomableLabel(QLabel):
         # 计算缩放后偏移量，使鼠标位置保持不动
         if old_factor != self.scale_factor:
             self.offset = cursor_pos - (cursor_pos - self.offset) * (self.scale_factor / old_factor)
-
         self.update_pixmap()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.last_pos = event.pos()
-
-    def mouseMoveEvent(self, event):
-        if self.last_pos is not None:
-            # 计算移动的偏移量
-            delta = event.pos() - self.last_pos
-            self.offset += delta
-            self.last_pos = event.pos()
-            self.update_pixmap()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -571,17 +1213,75 @@ class PreviewDialog(QDialog):
     def __init__(self, image_path, main_window=None, offset=QPoint(50, 50)):
         super().__init__(parent=None)
         self.setWindowTitle("预览")
-        self.setFixedSize(425, 425)
+        
+        # 根据图片大小调整窗口大小
+        pixmap = QPixmap(image_path)
+        if not pixmap.isNull():
+            # 获取屏幕大小
+            screen = QApplication.primaryScreen().geometry()
+            max_width = int(screen.width() * 0.8)
+            max_height = int(screen.height() * 0.8)
+            
+            # 计算合适的窗口大小，保持图片比例
+            img_width = pixmap.width()
+            img_height = pixmap.height()
+            
+            if img_width > max_width or img_height > max_height:
+                # 需要缩放
+                scale_w = max_width / img_width
+                scale_h = max_height / img_height
+                scale = min(scale_w, scale_h)
+                
+                window_width = int(img_width * scale)
+                window_height = int(img_height * scale)
+            else:
+                # 不需要缩放
+                window_width = img_width
+                window_height = img_height
+            
+            # 设置最小尺寸
+            window_width = max(300, window_width)
+            window_height = max(200, window_height)
+            
+            self.resize(window_width, window_height)
+        else:
+            # 如果图片加载失败，使用默认大小
+            self.resize(800, 600)
+        
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.offset = offset
         self.main_window = main_window
+        
         if main_window:
             self.setWindowIcon(main_window.windowIcon())
-
+        
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)  # 移除边距让按钮可以贴边显示
+        
         self.label = ZoomableLabel(image_path)
         layout.addWidget(self.label)
-
+        
+        # 连接图片改变信号来更新窗口标题
+        self.label.imageChanged.connect(self.update_title)
+        
+        # 设置焦点，使键盘事件生效
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.label.setFocusPolicy(Qt.StrongFocus)
+    
+    def update_title(self, image_path):
+        """更新窗口标题显示当前图片名"""
+        image_name = os.path.basename(image_path)
+        current_index = self.label.current_index + 1
+        total_images = len(self.label.image_list)
+        self.setWindowTitle(f"预览 - {image_name} ({current_index}/{total_images})")
+        
+        # 图片改变时可能需要调整窗口大小，延迟更新按钮位置
+        QTimer.singleShot(10, self.label.update_button_positions)
+    
+    def keyPressEvent(self, event):
+        """将键盘事件转发给 ZoomableLabel"""
+        self.label.keyPressEvent(event)
+    
     def showEvent(self, event):
         super().showEvent(event)
         if self.main_window:
@@ -590,7 +1290,9 @@ class PreviewDialog(QDialog):
             dialog_geom = self.frameGeometry()
             dialog_geom.moveCenter(main_center)
             self.move(dialog_geom.topLeft() + self.offset)
-
+        
+        # 初始化标题
+        self.update_title(self.label.current_image_path)
 
 # ==================== 高性能虚拟列表 ====================
 class HighPerformanceVirtualList(QAbstractScrollArea):
@@ -600,6 +1302,7 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
     itemClicked = pyqtSignal(int, dict)  # 点击信号：(索引, 数据)
     itemDoubleClicked = pyqtSignal(int, dict)  # 双击信号
     itemRightClicked = pyqtSignal(int, dict, QPoint)  # 右键信号
+    selectionChanged = pyqtSignal(set)  # 选择状态改变信号：(选中的索引集合)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -621,6 +1324,9 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         # 选中状态管理
         self.selected_indices = set()
         self.current_index = -1
+        
+        # 多选模式设置
+        self.multi_select_enabled = True  # 是否启用多选
         
         # 初始化
         self._init_widget_pool()
@@ -645,24 +1351,181 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
             widget.right_clicked.connect(self._on_widget_right_clicked)
             self.widget_pool.append(widget)
 
-    # 支持 Home/End
+    # 支持 Home/End/Ctrl+A
     def keyPressEvent(self, event):
+        """处理键盘事件"""
         if event.key() == Qt.Key_Home:
             # 滚动到顶部
             self.verticalScrollBar().setValue(0)
             # 选中第一项（如果有数据）
             if self.items_data:
+                if not (event.modifiers() & Qt.ShiftModifier):
+                    self.selected_indices.clear()
                 self.current_index = 0
-                self.viewport().update()
+                self.selected_indices.add(0)
+                self._update_visible_items()
+                self.selectionChanged.emit(self.selected_indices.copy())
+                
         elif event.key() == Qt.Key_End:
             # 滚动到底部
             self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
             # 选中最后一项（如果有数据）
             if self.items_data:
-                self.current_index = len(self.items_data) - 1
-                self.viewport().update()
+                last_index = len(self.items_data) - 1
+                if not (event.modifiers() & Qt.ShiftModifier):
+                    self.selected_indices.clear()
+                self.current_index = last_index
+                self.selected_indices.add(last_index)
+                self._update_visible_items()
+                self.selectionChanged.emit(self.selected_indices.copy())
+                
+        elif event.key() == Qt.Key_A and event.modifiers() & Qt.ControlModifier:
+            # Ctrl+A 全选
+            self.select_all()
+            
+        elif event.key() == Qt.Key_Escape:
+            # Esc 取消所有选择
+            self.clear_selection()
+            
+        elif event.key() in (Qt.Key_Up, Qt.Key_Down):
+            # 上下箭头键导航
+            self._handle_arrow_navigation(event)
+            
         else:
             super().keyPressEvent(event)
+    
+    def _handle_arrow_navigation(self, event):
+        """处理箭头键导航"""
+        if not self.items_data:
+            return
+            
+        old_current = self.current_index
+        
+        if event.key() == Qt.Key_Up:
+            self.current_index = max(0, self.current_index - 1)
+        elif event.key() == Qt.Key_Down:
+            self.current_index = min(len(self.items_data) - 1, self.current_index + 1)
+        
+        if self.current_index != old_current:
+            # 滚动到当前项
+            self._scroll_to_item(self.current_index)
+            
+            # 处理选择
+            if event.modifiers() & Qt.ShiftModifier:
+                # Shift + 箭头：范围选择
+                if self.selected_indices:
+                    # 扩展选择范围
+                    start = min(min(self.selected_indices), self.current_index)
+                    end = max(max(self.selected_indices), self.current_index)
+                    self.selected_indices = set(range(start, end + 1))
+                else:
+                    self.selected_indices.add(self.current_index)
+            elif event.modifiers() & Qt.ControlModifier:
+                # Ctrl + 箭头：不改变选择，只移动焦点
+                pass
+            else:
+                # 普通箭头：单选
+                self.selected_indices = {self.current_index}
+            
+            self._update_visible_items()
+            self.selectionChanged.emit(self.selected_indices.copy())
+    
+    def _scroll_to_item(self, index):
+        """滚动到指定项目"""
+        if not (0 <= index < len(self.items_data)):
+            return
+            
+        item_y = index * self.item_height
+        viewport_height = self.viewport().height()
+        current_scroll = self.verticalScrollBar().value()
+        
+        # 如果项目不在可见区域，则滚动
+        if item_y < current_scroll:
+            # 项目在上方，滚动到项目顶部
+            self.verticalScrollBar().setValue(item_y)
+        elif item_y + self.item_height > current_scroll + viewport_height:
+            # 项目在下方，滚动到项目底部可见
+            self.verticalScrollBar().setValue(item_y + self.item_height - viewport_height)
+
+    def select_all(self):
+        """全选所有项目"""
+        if not self.items_data or not self.multi_select_enabled:
+            return
+            
+        old_selection = self.selected_indices.copy()
+        self.selected_indices = set(range(len(self.items_data)))
+        
+        # 如果没有当前项，设置第一项为当前项
+        if self.current_index == -1:
+            self.current_index = 0
+            
+        # 更新UI
+        self._update_visible_items()
+        
+        # 发射选择改变信号
+        if old_selection != self.selected_indices:
+            self.selectionChanged.emit(self.selected_indices.copy())
+    
+    def clear_selection(self):
+        """清空所有选择"""
+        if not self.selected_indices:
+            return
+            
+        old_selection = self.selected_indices.copy()
+        self.selected_indices.clear()
+        self.current_index = -1
+        
+        # 更新UI
+        self._update_visible_items()
+        
+        # 发射选择改变信号
+        if old_selection:
+            self.selectionChanged.emit(self.selected_indices.copy())
+    
+    def select_items(self, indices):
+        """选择指定的项目"""
+        if not self.multi_select_enabled:
+            # 单选模式下只选择第一个
+            indices = indices[:1] if indices else []
+            
+        old_selection = self.selected_indices.copy()
+        self.selected_indices = set(i for i in indices if 0 <= i < len(self.items_data))
+        
+        # 设置当前项
+        if self.selected_indices:
+            self.current_index = min(self.selected_indices)
+        else:
+            self.current_index = -1
+            
+        # 更新UI
+        self._update_visible_items()
+        
+        # 发射选择改变信号
+        if old_selection != self.selected_indices:
+            self.selectionChanged.emit(self.selected_indices.copy())
+    
+    def get_selected_indices(self):
+        """获取选中的索引列表"""
+        return sorted(list(self.selected_indices))
+    
+    def get_selected_data(self):
+        """获取选中项的数据列表"""
+        return [self.items_data[i] for i in sorted(self.selected_indices) if 0 <= i < len(self.items_data)]
+    
+    def set_multi_select_enabled(self, enabled):
+        """设置是否启用多选模式"""
+        self.multi_select_enabled = enabled
+        if not enabled and len(self.selected_indices) > 1:
+            # 切换到单选模式时，只保留第一个选中项
+            first_selected = min(self.selected_indices) if self.selected_indices else -1
+            if first_selected >= 0:
+                self.selected_indices = {first_selected}
+                self.current_index = first_selected
+            else:
+                self.selected_indices.clear()
+                self.current_index = -1
+            self._update_visible_items()
+            self.selectionChanged.emit(self.selected_indices.copy())
 
     # 自动获取焦点
     def mousePressEvent(self, event):
@@ -696,6 +1559,7 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         
         self._update_scrollbar_range()
         self._update_visible_items()
+        self.selectionChanged.emit(self.selected_indices.copy())
     
     def _update_scrollbar_range(self):
         """更新滚动条范围"""
@@ -710,6 +1574,10 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         self.verticalScrollBar().setRange(0, max_scroll)
         self.verticalScrollBar().setPageStep(viewport_height)
         self.verticalScrollBar().setSingleStep(self.item_height)
+    
+    def _on_scroll(self):
+        """滚动事件处理"""
+        self._update_visible_items()
     
     def _update_visible_items(self):
         """更新可见项目 - 核心渲染逻辑"""
@@ -954,7 +1822,7 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         return self.performance_stats.copy()
 
 
-# ==================== 2. 虚拟列表专用的FolderItemWidget ====================
+# ==================== 虚拟列表专用的FolderItemWidget ====================
 class VirtualFolderItemWidget(QWidget):
     """专为虚拟列表设计的文件夹项目widget"""
     
@@ -1451,6 +2319,28 @@ class FolderDatabaseApp(QMainWindow):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
                 background: none;
             }
+
+            /* 进度条样式 */
+            QProgressBar {
+                border: 1px solid #dee2e6;
+                border-radius: 6px;
+                background-color: #ced4da;   
+                height: 12px;
+                text-align: center;
+                color: transparent;
+                font-size: 0px;
+                animation: none;
+                transition: none;
+            }
+            QProgressBar::chunk {
+                border: none;
+                border-radius: 5px;  /* 比外框小1px */
+                background-color: #007bff;
+                margin: 1px;
+                /* 确保不会超出父容器 */
+                max-width: calc(100% - 2px);
+                max-height: calc(100% - 2px);
+            }   
             
             /* 工具提示样式 */
             QToolTip {
@@ -1490,7 +2380,7 @@ class FolderDatabaseApp(QMainWindow):
         splitter.setSizes([150, 550])
         
         # 状态标签
-        self.status_label = QLabel("🟢就绪")
+        self.status_label = QLabel("<span style='color: #00d26a;'>●</span> 就绪")
         self.status_label.setObjectName("statusLabel")
         main_layout.addWidget(self.status_label)
 
@@ -1504,7 +2394,7 @@ class FolderDatabaseApp(QMainWindow):
         folder_layout = QHBoxLayout()
         folder_layout.setSpacing(10)
         
-        self.folder_path_edit = QLineEdit()
+        self.folder_path_edit = ChineseLineEdit()
         self.folder_path_edit.setPlaceholderText("点击'选择文件夹'按钮选择要扫描的根目录")
         self.folder_path_edit.setReadOnly(True)
         self.folder_path_edit.setMinimumHeight(36)
@@ -1522,7 +2412,7 @@ class FolderDatabaseApp(QMainWindow):
         search_layout = QHBoxLayout()
         search_layout.setSpacing(10)
         
-        self.search_term_edit = QLineEdit()
+        self.search_term_edit = ChineseLineEdit()
         self.search_term_edit.setPlaceholderText("输入子文件夹名称关键词，可用空格分隔多个关键词")
         self.search_term_edit.setMinimumHeight(36)
         
@@ -1553,7 +2443,7 @@ class FolderDatabaseApp(QMainWindow):
         db_search_layout = QHBoxLayout()
         db_search_layout.setSpacing(10)
         
-        self.db_search_edit = QLineEdit()
+        self.db_search_edit = ChineseLineEdit()
         self.db_search_edit.setPlaceholderText("输入关键词搜索文件夹，可用空格分隔多个关键词")
         self.db_search_edit.setMinimumHeight(36)
 
@@ -1705,10 +2595,13 @@ class FolderDatabaseApp(QMainWindow):
         # 添加菜单项
         import_action = self.menu.addAction("导入产品信息")
         import_action.triggered.connect(self.import_product_info)
-        
-        # export_action = self.menu.addAction("导出数据")
-        # export_action.triggered.connect(self.export_data)
-        # self.menu.addSeparator()
+        self.menu.addSeparator()  
+        import_action = self.menu.addAction("排序方式")
+        import_action.triggered.connect(self.show_sort_dialog)
+        self.menu.addSeparator()          
+        export_action = self.menu.addAction("检查更新")
+        export_action.triggered.connect(self.check_update)
+        self.menu.addSeparator()
         # settings_action = self.menu.addAction("设置")
         # settings_action.triggered.connect(self.show_settings)
         
@@ -1974,27 +2867,223 @@ class FolderDatabaseApp(QMainWindow):
         self.progress_dialog.setMinimumDuration(0)
         self.progress_dialog.setMinimumWidth(500)
         self.progress_dialog.resize(500, 120)
+        
+        # 设置初始进度为3%
+        self.progress_dialog.setValue(3)
         self.progress_dialog.show()
 
         # 创建子线程
         self.import_thread = ImportProductThread(self.folders_data, file_path)
-        self.import_thread.progress_changed.connect(
-            lambda percent, name: self.progress_dialog.setValue(percent) or self.progress_dialog.setLabelText(f"正在处理: {name}")
-        )
+        
+        # 连接信号
+        self.import_thread.progress_changed.connect(self._on_import_progress_changed)
         self.import_thread.finished.connect(self._on_import_finished)
+        
+        # 连接取消按钮信号
+        self.progress_dialog.canceled.connect(self._on_import_cancelled)
+        
         self.import_thread.start()
-        self.status_label.setText(f"正在导入产品信息")
+        self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 正在导入产品信息")
 
-    def _on_import_finished(self, updated_count, skipped_count):
-        self.progress_dialog.close()
-        # 保存数据库并刷新列表
-        self.save_database()
-        self.folder_list.update()
-        self.refresh_folder_list()
-        self.status_label.setText(f"导入完成")
-        QMessageBox.information(self, "导入完成", f"导入完成！\n已更新数量：{updated_count}\n跳过数量：{skipped_count}")    
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
+    def _on_import_progress_changed(self, percent, name):
+        """处理进度更新（忽略子线程错误信息）"""
+        if hasattr(self, 'progress_dialog') and self.progress_dialog and not self.progress_dialog.wasCanceled():
+            try:
+                self.progress_dialog.setValue(percent)
+                # 只显示任务名称，不显示任何错误信息
+                safe_name = name.split("->")[0]  # 如果 name 中包含异常描述，取前半部分
+                self.progress_dialog.setLabelText(f"正在处理: {safe_name}")
+            except (RuntimeError, AttributeError):
+                # 对话框已被销毁，停止处理
+                if hasattr(self, 'import_thread') and self.import_thread:
+                    self.import_thread.stop_processing()
 
+    def _on_import_cancelled(self):
+        """处理取消操作"""
+        if hasattr(self, 'import_thread') and self.import_thread and self.import_thread.isRunning():
+            # 停止线程处理
+            self.import_thread.stop_processing()
+            # 更新状态
+            self.status_label.setText(f"<span style='color: #ff6b6b;'>●</span> 正在取消导入...")
+        
+        # 标记对话框为None，避免后续访问
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog = None
+
+    def _on_import_finished(self, updated_count, skipped_count, was_cancelled):
+        """处理导入完成"""
+        # 安全关闭进度对话框
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            try:
+                if not self.progress_dialog.wasCanceled():
+                    self.progress_dialog.close()
+            except (RuntimeError, AttributeError):
+                pass  # 对话框已被销毁
+            finally:
+                self.progress_dialog = None
+
+        if was_cancelled:
+            # 处理取消情况
+            self.status_label.setText(f"<span style='color: #ff6b6b;'>●</span> 导入已取消")
+            QMessageBox.information(
+                self, 
+                "导入已取消", 
+                f"导入已取消！\n已处理数量：{updated_count}\n跳过数量：{skipped_count}"
+            )
+        else:
+            # 处理正常完成情况
+            # 保存数据库并刷新列表
+            try:
+                self.save_database()
+                self.folder_list.update()
+                self.refresh_folder_list()
+            except Exception as e:
+                print(f"保存数据库或刷新列表时出错: {e}")
+            
+            self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 导入完成")
+            QMessageBox.information(
+                self, 
+                "导入完成", 
+                f"导入完成！\n已更新数量：{updated_count}\n跳过数量：{skipped_count}"
+            )
+        
+        # 最终状态更新
+        try:
+            self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）")
+        except AttributeError:
+            self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪")
+        
+        # 清理线程引用
+        if hasattr(self, 'import_thread'):
+            self.import_thread = None
+
+    #排序逻辑
+    def show_sort_dialog(self):
+        """弹出排序设置对话框并排序虚拟列表"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("排序设置")
+        dialog.setFixedSize(280, 350)
+        dialog.setWindowModality(Qt.ApplicationModal)
+
+        layout = QVBoxLayout(dialog)
+
+        # ---------------- 排序方式组 ----------------
+        order_groupbox = QGroupBox("排序方式")
+        order_layout = QVBoxLayout(order_groupbox)
+
+        asc_radio = QRadioButton("升序")
+        desc_radio = QRadioButton("降序")
+        desc_radio.setChecked(True)  # 默认降序
+
+        order_group = QButtonGroup(dialog)
+        order_group.addButton(asc_radio)
+        order_group.addButton(desc_radio)
+
+        order_layout.addWidget(asc_radio)
+        order_layout.addWidget(desc_radio)
+
+        layout.addWidget(order_groupbox)
+
+        # ---------------- 排序字段组 ----------------
+        field_groupbox = QGroupBox("排序字段")
+        field_layout = QVBoxLayout(field_groupbox)
+
+        name_radio = QRadioButton("名称")
+        add_date_radio = QRadioButton("添加日期")
+        modify_date_radio = QRadioButton("修改日期")
+        add_date_radio.setChecked(True)  # 默认添加日期
+
+        field_group = QButtonGroup(dialog)
+        field_group.addButton(name_radio)
+        field_group.addButton(add_date_radio)
+        field_group.addButton(modify_date_radio)
+
+        field_layout.addWidget(name_radio)
+        field_layout.addWidget(add_date_radio)
+        field_layout.addWidget(modify_date_radio)
+
+        layout.addWidget(field_groupbox)
+
+        # ---------------- 按钮 ----------------
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(2, 0, 2, 0)  # 内边距
+        ok_btn = QPushButton("应用排序")
+        cancel_btn = QPushButton("取消")
+
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        # ---------------- 从配置文件读取默认选项 ----------------
+        sort_order = self.config.get('sort_order', 'desc')
+        sort_field = self.config.get('sort_field', 'add_date')
+
+        if sort_order == 'asc':
+            asc_radio.setChecked(True)
+        else:
+            desc_radio.setChecked(True)
+
+        if sort_field == 'name':
+            name_radio.setChecked(True)
+        elif sort_field == 'add_date':
+            add_date_radio.setChecked(True)
+        else:
+            modify_date_radio.setChecked(True)
+
+        #按钮事件
+        def apply_sort():
+            order = 'asc' if asc_radio.isChecked() else 'desc'
+            if name_radio.isChecked():
+                field = 'name'
+            elif add_date_radio.isChecked():
+                field = 'add_date'
+            else:
+                field = 'modify_date'
+
+            # 保存配置
+            self.config['sort_order'] = order
+            self.config['sort_field'] = field
+            self.save_config()
+
+            # 调用统一排序函数
+            self.sort_folders()
+            dialog.accept()
+
+        ok_btn.clicked.connect(apply_sort)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        # 显示窗口
+        dialog.exec_() 
+
+    #统一排序函数
+    def sort_folders(self):
+        """根据配置文件排序虚拟列表和数据库文件"""
+        # 读取配置
+        order = self.config.get('sort_order', 'desc')       # 默认降序
+        field = self.config.get('sort_field', 'add_date')   # 默认添加日期
+        reverse = order == 'desc'
+
+        def sort_key(item):
+            return item.get(field, "")
+
+        # 排序虚拟列表
+        self.folder_list.items_data.sort(key=sort_key, reverse=reverse)
+        # 同步更新主数据源
+        self.folders_data = self.folder_list.items_data.copy()
+
+        # 清空选中状态
+        self.folder_list.selected_indices.clear()
+        self.folder_list.current_index = -1
+        self.folder_list._update_visible_items()
+        self.folder_list.selectionChanged.emit(self.folder_list.selected_indices.copy())
+
+        # 保存数据库文件
+        try:
+            with open(self.database_file, 'w', encoding='utf-8') as f:
+                json.dump(self.folders_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存数据库文件失败：{e}")
     #---------以上是菜单项逻辑------------------------------------------------
 
     def setup_hover_effects(self):
@@ -2071,16 +3160,18 @@ class FolderDatabaseApp(QMainWindow):
 
         # 显示菜单
         menu.exec_(global_pos)
-        
+
+    # 复制路径       
     def copy_path(self, folder_data):
         """复制文件夹路径"""
         folder_path = folder_data.get("path", "")
         if folder_path:
             clipboard = QApplication.clipboard()
             clipboard.setText(folder_path)
-            self.status_label.setText(f"已复制路径：{folder_path}")
-            QTimer.singleShot(2000, lambda: self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）"))
+            self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 已复制路径：{folder_path}")
+            QTimer.singleShot(2000, lambda: self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）"))
 
+    # 编辑备注
     def edit_folder_remark(self, folder_data):
         """编辑文件夹备注"""
         folder_name = folder_data.get("name", "未知文件夹")
@@ -2122,6 +3213,8 @@ class FolderDatabaseApp(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             new_remark = remark_text.toPlainText().strip()
             folder_data["remark"] = new_remark  # 更新数据字典
+            # 更新修改日期（自动使用当前时间）
+            self.update_folder_field_value(folder_data, "modify_date")
 
             # 更新虚拟列表中对应 widget
             for index, data in enumerate(self.folder_list.items_data):
@@ -2149,7 +3242,7 @@ class FolderDatabaseApp(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "保存失败", f"无法保存产品信息文件：{e}")
 
-
+    #更换缩略图
     def change_thumbnail(self, folder_data):
         """更换缩略图"""
         folder_name = folder_data.get("name", "未知文件夹")
@@ -2175,6 +3268,8 @@ class FolderDatabaseApp(QMainWindow):
         if new_thumb_path:
             # 更新数据字典
             folder_data["thumbnail"] = new_thumb_path
+            # 更新修改日期（自动使用当前时间）
+            self.update_folder_field_value(folder_data, "modify_date")
 
             # 缓存新的缩略图
             pixmap = QPixmap(new_thumb_path).scaled(70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -2282,7 +3377,7 @@ class FolderDatabaseApp(QMainWindow):
         self.progress_dialog.canceled.connect(self.cancel_zip_generation)
         
         self.zip_thread.start()
-        self.status_label.setText(f"正在生成原图证明文件...")
+        self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 正在生成原图证明文件...")
 
     def update_progress(self, value):
         """更新进度条"""
@@ -2290,9 +3385,13 @@ class FolderDatabaseApp(QMainWindow):
             self.progress_dialog.setValue(value)
 
     def update_progress_text(self, current_index, total_count, folder_name, task_detail):
-        """更新进度对话框的文本"""
+        """更新进度对话框文本，不显示错误信息"""
         if hasattr(self, 'progress_dialog') and self.progress_dialog:
-            progress_text = f"正在处理 ({current_index}/{total_count}): {folder_name} - {task_detail}"
+            # 只显示普通任务描述，过滤掉可能包含“出错”的 task_detail
+            safe_detail = "" if "出错" in task_detail else task_detail
+            progress_text = f"正在处理 ({current_index}/{total_count}): {folder_name}"
+            if safe_detail:
+                progress_text += f" - {safe_detail}"
             self.progress_dialog.setLabelText(progress_text)
 
     def on_task_completed(self, folder_name, result):
@@ -2316,8 +3415,9 @@ class FolderDatabaseApp(QMainWindow):
             self.progress_dialog.close()
             self.progress_dialog = None
         
-        self.status_label.setText("处理已取消")
-        QTimer.singleShot(2000, lambda: self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）"))
+        self.status_label.setText("<span style='color: #ffdb29;'>●</span> 处理已取消")
+        QTimer.singleShot(2000, lambda: self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）"))
+    
     def on_all_completed(self, results):
         """所有任务完成处理"""
         # 关闭进度对话框
@@ -2408,9 +3508,10 @@ class FolderDatabaseApp(QMainWindow):
                 for item in failed_items:
                     result_message += f"{item}\n"
         
-        self.status_label.setText(f"处理完成: 成功 {success_count}/{total_count}")
+        self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 处理完成: 成功 {success_count}/{total_count}")
         QMessageBox.information(self, "处理完成", result_message)
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")   
+        self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}） ")   
+    
     def show_proof_file_dialog(self):
         """显示原创摄影作品声明文件提示对话框"""
         msg_box = QMessageBox(self)
@@ -2525,7 +3626,7 @@ class FolderDatabaseApp(QMainWindow):
         search_term = self.search_term_edit.text().strip()
         self.config['last_search_term'] = search_term.replace('/', '\\')
         self.save_config()
-        
+
         if not folder_path:
             QMessageBox.warning(self, "警告", "请先选择要扫描的文件夹！")
             return
@@ -2536,28 +3637,26 @@ class FolderDatabaseApp(QMainWindow):
             QMessageBox.warning(self, "警告", "选择的文件夹不存在！")
             return
 
-        # ---- 设置按钮状态 ----
-        self.add_button.setEnabled(False)  # 禁用按钮，防止重复点击
-        self.add_button.setText("扫描中...")  # 设置为扫描中状态
-        self.status_label.setText(f"正在扫描文件夹: {folder_path}")
-        # ---- 结束按钮状态 ----
+        self.add_button.setEnabled(False)
+        self.add_button.setText("扫描中...")
+        self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 正在扫描文件夹: {folder_path}")
 
-        # 创建并启动扫描线程
         self.scanner_thread = FolderScanner(folder_path, search_term, added_paths=self.added_folder_paths)
 
-        # 连接信号
+        # 接收日期字段
         self.scanner_thread.folder_found.connect(
-            lambda name, path, thumb, remark: self.add_folder_realtime({
+            lambda name, path, thumb, remark, _, modify_date: self.add_folder_realtime({
                 'name': name,
                 'path': path,
                 'thumbnail': thumb,
-                'remark': remark
+                'remark': remark,
+                'add_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # 扫描时的时间
+                'modify_date': modify_date
             })
         )
         self.scanner_thread.scan_finished.connect(self.scan_completed)
         self.scanner_thread.update_status.connect(self.update_status_label)
 
-        # 启动线程
         self.scanner_thread.start()
 
     def update_status_label(self, text):
@@ -2565,13 +3664,13 @@ class FolderDatabaseApp(QMainWindow):
         QApplication.processEvents()  # 强制刷新界面
         
     def add_folder_realtime(self, folder):
-        """单条数据实时添加到虚拟列表"""
+        """单条数据实时添加到虚拟列表（最新添加在最上面）"""
         path = folder.get("path", "")
         if not path or path in self.added_folder_paths:
             return
 
-        # 添加到数据源
-        self.folders_data.append(folder)
+        # 添加到数据源开头
+        self.folders_data.insert(0, folder)
         self.added_folder_paths.add(path)
 
         # 刷新虚拟列表
@@ -2579,23 +3678,24 @@ class FolderDatabaseApp(QMainWindow):
         QApplication.processEvents()  # 强制刷新界面
 
     def scan_completed(self, found_count, skipped_count):
+        self.sort_folders() #应用排序
         # 恢复按钮状态
         self.add_button.setEnabled(True)  # 重新启用按钮
         self.add_button.setText("写入数据库")  
-        status_text = f"扫描完成，找到 {found_count} 个匹配的文件夹，跳过了 {skipped_count} 个已添加的文件夹"
+        status_text = f"<span style='color: #ffdb29;'>●</span> 扫描完成，找到 {found_count} 个匹配的文件夹，跳过了 {skipped_count} 个已添加的文件夹"
         self.status_label.setText(status_text)
 
-        msg = f"成功找到并添加了 {found_count} 个文件夹到数据库！\n\n"
-        msg += f"跳过了 {skipped_count} 个已经添加过的文件夹。\n"
+        msg = f"成功写入 {found_count} 个文件夹到数据库！\n\n"
+        msg += f"跳过 {skipped_count} 个已在数据库的文件夹。\n"
 
         if found_count > 0:
             msg += f"总计：新增 {found_count} 个，跳过 {skipped_count} 个。"
         else:
-            msg += "未找到新的匹配文件夹。"
+            msg += "未扫描到新的匹配文件夹。"
 
         QMessageBox.information(self, "扫描完成", msg)
         self.total_num = self.total_num + found_count
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
+        self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}） ")
         self.save_database()
   # -------------------- 以上为扫描逻辑 --------------------
 
@@ -2620,7 +3720,7 @@ class FolderDatabaseApp(QMainWindow):
         # 更新虚拟列表
         self.folder_list.set_data(filtered_data)
         self.total_num = len(filtered_data)
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
+        self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）")
 
     #双击打开文件夹目录
     def open_folder(self, index_or_data):
@@ -2714,7 +3814,7 @@ class FolderDatabaseApp(QMainWindow):
 
             # 更新状态栏
             self.total_num = len(self.folder_list.items_data)
-            self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
+            self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）")
             QMessageBox.information(
                 self,
                 "删除成功",
@@ -2748,16 +3848,37 @@ class FolderDatabaseApp(QMainWindow):
             self.added_folder_paths.clear()
             self.folder_list.set_data([])
             self.save_database()
-            self.status_label.setText("数据库已清空，所有缩略图已删除")
+            self.status_label.setText("<span style='color: #ffdb29;'>●</span> 数据库已清空，所有缩略图已删除")
             QMessageBox.information(self, "完成", "数据库已清空，所有缩略图已删除！")
             self.total_num = 0
-            self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}） ")
+            self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}） ")
 
     #刷新数据库
     def refresh_folder_list(self):
         """刷新文件夹列表"""
         self.folder_list.set_data(self.folders_data[:])
         self.save_database()
+
+    #更新文件夹字段
+    def update_folder_field_value(self, folder_data, key, value=None, save_db=True):
+        """
+        更新指定字段的值，不影响其他字段
+        folder_data: 虚拟列表中某个数据项的字典引用
+        key: 要修改的字段名，例如 'add_date' 或 'modify_date'
+        value: 新值，如果 key 是 'modify_date' 则忽略，使用当前时间
+        save_db: 是否更新数据库文件
+        """
+        if not folder_data or key not in folder_data:
+            return
+
+        if key == "modify_date":
+            folder_data[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            folder_data[key] = value
+
+        if save_db:
+            self.save_database()
+
     
   # -------------------- 以下为加载数据库逻辑 --------------------
     def load_database(self):
@@ -2788,7 +3909,7 @@ class FolderDatabaseApp(QMainWindow):
 
         # 刷新虚拟列表
         self.folder_list.set_data(self.folders_data[:])
-        self.status_label.setText(f"正在收集数据 {current}/{total}")
+        self.status_label.setText(f"<span style='color: #ffdb29;'>●</span> 正在收集数据 {current}/{total}")
         QApplication.processEvents()
 
     def on_load_finished(self, total=0):
@@ -2796,7 +3917,8 @@ class FolderDatabaseApp(QMainWindow):
         # 最终更新虚拟列表
         self.folder_list.set_data(self.folders_data[:])
         
-        self.status_label.setText(f"🟢 就绪 （总计：{self.total_num}）")
+        self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）")
+
         self.database_load_finished = True
         # self.save_database()
         
@@ -2844,6 +3966,12 @@ class FolderDatabaseApp(QMainWindow):
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存配置文件失败：{str(e)}\n请以管理员身份运行此程序！")
+
+    #检查更新
+    def check_update(self):
+        """显示更新对话框"""
+        dialog = UpdateDialog(self, CURRENT_VERSION)
+        dialog.exec_()
     
     # 关闭程序时保存数据库和配置
     def closeEvent(self, event):
