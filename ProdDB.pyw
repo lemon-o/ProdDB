@@ -24,7 +24,7 @@ from datetime import datetime
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.0.4" #版本号
+CURRENT_VERSION = "v1.0.5" #版本号
 
 
         
@@ -3625,44 +3625,52 @@ class FolderDatabaseApp(QMainWindow):
 
             # 原始 HTML 模板，保持不变
             html_content = f"""<div style="clear: both;"></div><meta charset="UTF-8"><div style="clear: both;">
-        </div><title>产品图片侵权通知</title><div style="clear: both;">
-        </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: rgb(255, 255, 255); overflow: hidden; padding: 0px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">
-        <div class="content" style="padding: 0px 0px 20px;">
+                    </div><title>产品图片侵权通知</title><div style="clear: both;">
+                    </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: #fff; overflow: hidden; padding: 0px; font-family: 'Microsoft YaHei', sans-serif;">
+                    <div class="content" style="padding: 0px 0px 20px;">
 
-            <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
+                        <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}发现以下链接未经授权使用了{main_body}拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对侵权链接进行处理。</p>
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">本公司发现以下商品未经授权使用了本公司拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对涉案侵权商品在<strong>所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理</strong>。</p>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}的产品摄影图原图及相关证明材料见附件。</p>
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">本公司的产品摄影图原图及相关证明材料见附件。</p>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权链接：</strong></p>
-            {links_html}
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权产品：</strong></p>
+                        {links_html}
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
-            <ul style="padding-left: 20px; margin: 10px 0px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">
-            <li style="margin: 6px 0px; line-height: 22.4px; font-size: 14px;"><div style="clear: both; font-size: 14px; line-height: 22.4px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">{main_body}是上述产品图片的版权所有者。</div></li>
-            <li style="margin: 6px 0px; line-height: 22.4px; font-size: 14px;"><div style="clear: both; font-size: 14px; line-height: 22.4px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">{main_body}真诚地相信，上述链接中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</div></li>
-            <li style="margin: 6px 0px; line-height: 22.4px; font-size: 14px;"><div style="clear: both; font-size: 14px; line-height: 22.4px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">本通知中的信息真实准确。</div></li>
-            <li style="margin: 6px 0px; line-height: 22.4px; font-size: 14px;"><div style="clear: both; font-size: 14px; line-height: 22.4px; font-family: &quot;Microsoft YaHei&quot;, sans-serif;">在作伪证将承担法律责任的前提下，{main_body}声明{main_body}是版权所有者。</div></li>
-            </ul>
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
+                        <ul style="padding-left: 20px; margin: 10px 0px;">
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本公司是上述产品图片的版权所有者。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">经核实，涉案商品在多个站点均由同一销售主体或关联账户运营，并且商品信息、图片完全一致，构成全平台范围的系统性侵权。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本公司真诚地相信，上述商品中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本通知中的信息真实准确。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">在作伪证将承担法律责任的前提下，本公司声明本公司是版权所有者。</li>
+                        </ul>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>权利人信息：</strong></p>
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">
-            {company_info_html}联系人：{contact}<br>
-            电话：{phone}<br>
-            邮箱：<a href="mailto:{email_addr}" style="color: rgb(254, 172, 28); text-decoration: none;">{email_addr}</a>
-            </p>
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>本公司要求：</strong></p>
+                        <ul style="padding-left: 20px; margin: 10px 0px;">
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">Temu 平台应立即对涉案侵权商品在所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理，而非仅限单一站点。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">对相关卖家进行处罚，并建立拦截机制，防止该商品在其他站点再次上架。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">若 Temu 仅对部分站点处理，而继续允许其他站点销售侵权商品，则属于明知侵权仍纵容传播，本公司将保留进一步追究 Temu 平台连带责任的权利，包括但不限于向国家知识产权局、工商管理部门以及境外监管机构投诉，直至提起诉讼。</li>
+                        </ul>
 
-            <div class="signature" style="margin-top: 20px;">
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">签名：{signature_name}</p>
-            </div>
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>权利人信息：</strong></p>
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">
+                            {company_info_html}联系人：{contact}<br>
+                            电话：{phone}<br>
+                            邮箱：<a href="mailto:{email_addr}" style="color: #FEAC1C; text-decoration: none;">{email_addr}</a>
+                        </p>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">感谢贵单位的支持和协助！</p>
+                        <div class="signature" style="margin-top: 20px;">
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">签名：{signature_name}</p>
+                        </div>
 
-            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">此致<br>敬礼</p>
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">感谢贵单位的支持和协助！</p>
 
-        </div>
-        </div>"""
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">此致<br>敬礼</p>
+
+                    </div>
+                    </div>"""
 
             # 保存原始HTML内容用于复制
             dialog.html_content = html_content
