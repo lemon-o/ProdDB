@@ -21,13 +21,203 @@ from PyQt5.QtCore import pyqtProperty
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageFile
 from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import threading
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.0.5" #版本号
+CURRENT_VERSION = "v1.0.7" #版本号
 
 
-        
+
+#---------------子线程 同步功能---------------------------------------
+class SyncSignals(QObject):
+    """同步信号：用于子线程向主线程发送更新请求"""
+    # 信号：JSON 更新 (folder_data, remark)
+    json_updated = pyqtSignal(object, str)
+    
+    # 信号：缩略图更新 (folder_data, pixmap)
+    thumbnail_updated = pyqtSignal(object, object)
+    
+    # 信号：刷新列表
+    refresh_list = pyqtSignal()
+
+
+# =============== 在线同步 ===============
+class FolderSyncHandler(FileSystemEventHandler):
+    """统一处理 JSON 和云端缩略图变化"""
+    def __init__(self, signals, folders_data, folder_data=None):
+        super().__init__()
+        self.signals = signals
+        self.folders_data = folders_data  # 所有文件夹数据
+        self.folder_data = folder_data  # 特定文件夹（用于缩略图监听）
+
+    def on_created(self, event):
+        self._handle_event(event)
+
+    def on_modified(self, event):
+        self._handle_event(event)
+
+    def _handle_event(self, event):
+        if event.is_directory:
+            return
+        file_path = os.path.abspath(event.src_path)
+
+        # ----------- JSON 文件处理 -----------
+        if file_path.lower().endswith("_产品信息.json"):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                folder_name = data.get("name")
+                remark = data.get("remark", "")
+
+                # 找到对应的 folder_data
+                for folder_data in self.folders_data:
+                    if folder_data.get("name") == folder_name:
+                        # 发送信号到主线程
+                        self.signals.json_updated.emit(folder_data, remark)
+                        break
+            except Exception as e:
+                print(f"[监听] JSON 处理失败: {e}")
+            return
+
+        # ----------- 云端缩略图变化 -----------
+        if self.folder_data:
+            cloud_thumb_path = os.path.abspath(self.folder_data.get("thumbnail_cloud", ""))
+            local_thumb_path = self.folder_data.get("thumbnail", "")
+            if cloud_thumb_path and cloud_thumb_path == file_path and os.path.exists(cloud_thumb_path):
+                try:
+                    # 复制到本地 thumbnail
+                    shutil.copy2(cloud_thumb_path, local_thumb_path)
+
+                    # 加载新的 pixmap 并发送信号
+                    pixmap = QPixmap(local_thumb_path).scaled(
+                        70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    self.signals.thumbnail_updated.emit(self.folder_data, pixmap)
+                except Exception as e:
+                    print(f"[监听] 复制云端缩略图失败: {e}")
+
+
+class FolderSyncWatcher(threading.Thread):
+    """统一监听线程，包含 JSON 和云端缩略图"""
+    def __init__(self, signals, folders_data):
+        super().__init__(daemon=True)
+        self.signals = signals
+        self.folders_data = folders_data
+        self.observer = Observer()
+
+    def run(self):
+        # ---------- 监听每个 folder_data 的已修 JSON ----------
+        for folder_data in self.folders_data:
+            fixed_folder = os.path.join(folder_data["path"], "已修")
+            if os.path.exists(fixed_folder):
+                handler = FolderSyncHandler(self.signals, self.folders_data)
+                self.observer.schedule(handler, fixed_folder, recursive=False)
+
+        # ---------- 监听每个 folder_data 的 thumbnail_cloud ----------
+        for folder_data in self.folders_data:
+            cloud_thumb_path = folder_data.get("thumbnail_cloud")
+            if cloud_thumb_path and os.path.exists(cloud_thumb_path):
+                folder_dir = os.path.dirname(cloud_thumb_path)
+                handler = FolderSyncHandler(self.signals, self.folders_data, folder_data)
+                self.observer.schedule(handler, folder_dir, recursive=False)
+
+        self.observer.start()
+        try:
+            while True:
+                threading.Event().wait(1)
+        finally:
+            self.observer.stop()
+            self.observer.join()
+
+
+# =============== 离线同步 ===============
+def calculate_max_workers(task_type="io", factor=1.5):
+    """自动计算推荐线程数"""
+    try:
+        cpu_count = os.cpu_count() or 4
+        if task_type.lower() == "cpu":
+            return cpu_count
+        elif task_type.lower() == "io":
+            return max(2, int(cpu_count * factor))
+        else:
+            return cpu_count
+    except Exception:
+        return 4
+
+
+class OfflineSyncThreadPool(threading.Thread):
+    """离线同步线程（线程池并行处理 JSON 和缩略图）"""
+    def __init__(self, signals, folders_data, update_folder_field_value_func):
+        super().__init__(daemon=True)
+        self.signals = signals
+        self.folders_data = folders_data
+        self.update_folder_field_value = update_folder_field_value_func
+        self.max_workers = calculate_max_workers(task_type="io")
+
+    def run(self):
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = []
+                for folder_data in self.folders_data:
+                    futures.append(executor.submit(self.process_folder, folder_data))
+
+                # 等待所有任务完成
+                for future in futures:
+                    future.result()
+        except Exception as e:
+            print(f"[离线同步] 线程池异常: {e}")
+
+    def process_folder(self, folder_data):
+        folder_changed = False
+
+        # ---------- JSON 文件处理 ----------
+        fixed_folder = os.path.join(folder_data["path"], "已修")
+        if os.path.exists(fixed_folder):
+            safe_name = "".join(c for c in folder_data["name"] if c not in "\\/:*?\"<>|")
+            json_file = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
+            if os.path.exists(json_file):
+                try:
+                    mtime = os.path.getmtime(json_file)
+                    if "_last_json_mtime" not in folder_data:
+                        folder_data["_last_json_mtime"] = mtime
+                    elif mtime > folder_data["_last_json_mtime"]:
+                        with open(json_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        remark = data.get("remark", "")
+                        folder_data["_last_json_mtime"] = mtime
+                        
+                        # 发送信号到主线程更新
+                        self.signals.json_updated.emit(folder_data, remark)
+                        folder_changed = True
+                except Exception as e:
+                    print(f"[离线同步] 读取 JSON 失败: {e}")
+
+        # ---------- 缩略图处理 ----------
+        cloud_thumb = folder_data.get("thumbnail_cloud", "").strip()
+        local_thumb = folder_data.get("thumbnail", "").strip()
+        if cloud_thumb and os.path.exists(cloud_thumb):
+            try:
+                mtime = os.path.getmtime(cloud_thumb)
+                if "_last_thumb_mtime" not in folder_data:
+                    folder_data["_last_thumb_mtime"] = mtime
+                elif mtime > folder_data["_last_thumb_mtime"]:
+                    os.makedirs(os.path.dirname(local_thumb), exist_ok=True)
+                    shutil.copy2(cloud_thumb, local_thumb)
+                    folder_data["_last_thumb_mtime"] = mtime
+
+                    # 加载 pixmap 并发送信号
+                    pixmap = QPixmap(local_thumb).scaled(
+                        70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    self.signals.thumbnail_updated.emit(folder_data, pixmap)
+                    folder_changed = True
+            except Exception as e:
+                print(f"[离线同步] 复制缩略图失败: {e}")
+
+
 #---------------子线程 检查更新----------------------------------
 class CheckUpdateThread(QThread):
     update_checked = pyqtSignal(dict, str)  # 传递检查结果和错误信息
@@ -47,14 +237,74 @@ class CheckUpdateThread(QThread):
 
 # 检测更新窗口
 class UpdateDialog(QDialog):
-    def __init__(self, parent=None, current_version=""):
-        super().__init__(parent)
+    """更新检查对话框 - 使用透明度技术防止左上角闪现"""
+    
+    def __init__(self, parent=None, current_version="", offset=QPoint(0, 0)):
+        super().__init__(parent=parent)
         self.current_version = current_version
         self.latest_version = ""
         self.download_url = ""
+        self.offset = offset
+        self.main_window = parent
+        self._position_set = False
+        self._first_show = True
+        
+        #初始时设置窗口为不可见，并移到屏幕外
+        self.setWindowOpacity(0)  # 设置完全透明
+        self.move(-10000, -10000)  # 移到屏幕外
+        
+        # 先设置UI（这样可以获取到正确的窗口大小）
         self.setup_ui()
-        self.show()  # 立即显示窗口
-        self.start_check_update()  # 使用专用线程检查更新
+        
+        # 在显示前设置位置
+        self.set_initial_position()
+        
+        # 现在可以安全地显示窗口
+        self.show()
+        
+        # 最后开始检查更新
+        self.start_check_update()
+    
+    def set_initial_position(self):
+        """在显示前设置初始位置"""
+        if self._position_set:
+            return
+            
+        if self.main_window:
+            # 相对于父窗口居中
+            main_geom = self.main_window.frameGeometry()
+            main_center = main_geom.center()
+            dialog_geom = self.frameGeometry()
+            dialog_geom.moveCenter(main_center)
+            self.move(dialog_geom.topLeft() + self.offset)
+        else:
+            # 如果没有父窗口，在屏幕中央显示
+            screen = QApplication.primaryScreen().geometry()
+            self.move(screen.center() - self.rect().center() + self.offset)
+        
+        self._position_set = True
+    
+    def showEvent(self, event):
+        """重写showEvent，在第一次显示时延迟恢复可见性"""
+        super().showEvent(event)
+        
+        if self._first_show:
+            self._first_show = False
+            # 确保位置已设置
+            if not self._position_set:
+                self.set_initial_position()
+            
+            # 延迟一帧后恢复可见性
+            QTimer.singleShot(1, self._make_visible)
+    
+    def _make_visible(self):
+        """使窗口可见"""
+        # 再次确认位置
+        if not self._position_set:
+            self.set_initial_position()
+        
+        # 恢复透明度，让窗口可见
+        self.setWindowOpacity(1.0)
         
     def setup_ui(self):
         self.setWindowTitle("检查更新")
@@ -89,6 +339,8 @@ class UpdateDialog(QDialog):
         
         # 按钮布局 - 只在检查更新窗口显示
         button_height1 = self.height() // 5
+        # 设置进度条高度为按钮高度的1/3
+        self.progress_bar.setFixedHeight(button_height1 // 2)
         button_style = """
         QPushButton {
             background-color: #ffffff;
@@ -968,8 +1220,9 @@ class ZipGeneratorThread(QThread):
         estimated_files = self.count_files_in_directory(source_folder)
         self.create_zip_file_with_progress(source_folder, zip_path, folder_name, 0, 1, 0, 1, estimated_files)
 
+#--------------子线程 扫描文件夹-----------------------
 class FolderScanner(QThread):
-    folder_found = pyqtSignal(str, str, str, str, str, str)  # name, path, thumb, remark, add_date, modify_date
+    folder_found = pyqtSignal(str, str, str, str, str, str, str) 
     scan_finished = pyqtSignal(int, int)
     update_status = pyqtSignal(str)
 
@@ -1010,7 +1263,7 @@ class FolderScanner(QThread):
                             remark = ""
 
                             if os.path.exists(fixed_folder):
-                                thumbnail_path = self._generate_thumbnail(item_path, item)
+                                thumbnail_cloud, thumbnail = self._generate_thumbnail(item_path, item)
                                 safe_name = "".join(c for c in item if c not in "\\/:*?\"<>|")
                                 json_file_path = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
                                 if os.path.exists(json_file_path):
@@ -1028,7 +1281,7 @@ class FolderScanner(QThread):
                             modify_date = datetime.fromtimestamp(modify_timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
                             # 发射信号
-                            self.folder_found.emit(item, item_path, thumbnail_path, remark, add_date, modify_date)
+                            self.folder_found.emit(item, item_path, thumbnail, remark, add_date, modify_date, thumbnail_cloud)
                             self.found_count += 1
 
                         continue
@@ -1039,12 +1292,33 @@ class FolderScanner(QThread):
             pass
 
     def _generate_thumbnail(self, folder_path, folder_name):
-        from PIL import Image
-        thumbnail_dir = os.path.join(os.getcwd(), "thumbnail")
+        # 云端缩略图目录：当前 folder_path 下
+        thumbnail_cloud_dir = folder_path
+        os.makedirs(thumbnail_cloud_dir, exist_ok=True)
+
+        # 本地程序工作目录下的缩略图目录
+        program_dir = os.getcwd()
+        thumbnail_dir = os.path.join(program_dir, "thumbnail")
         os.makedirs(thumbnail_dir, exist_ok=True)
+
+        # 云端缩略图路径
+        thumbnail_cloud_path = os.path.join(thumbnail_cloud_dir, f"{folder_name}.png")
+        # 本地缩略图路径
+        thumbnail_path = os.path.join(thumbnail_dir, f"{folder_name}.png")
+
+        # 如果云端缩略图已存在，则直接返回路径，跳过生成和复制
+        if os.path.exists(thumbnail_cloud_path):
+            # 本地缩略图不存在时才复制
+            if not os.path.exists(thumbnail_path):
+                try:
+                    shutil.copy2(thumbnail_cloud_path, thumbnail_path)
+                except Exception as e:
+                    print(f"复制云端缩略图到本地失败: {e}")
+            return thumbnail_cloud_path, thumbnail_path
+
         fixed_folder = os.path.join(folder_path, "已修")
         if not os.path.exists(fixed_folder):
-            return ""
+            return "", ""
 
         for file in os.listdir(fixed_folder):
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
@@ -1052,13 +1326,19 @@ class FolderScanner(QThread):
                 try:
                     img = Image.open(image_path).convert("RGBA")
                     img = img.resize((400, 400), Image.Resampling.LANCZOS)
-                    save_path = os.path.join(thumbnail_dir, f"{folder_name}.png")
-                    img.save(save_path, "PNG")
-                    return save_path
+
+                    # 保存到 folder_path 下（thumbnail_cloud）
+                    img.save(thumbnail_cloud_path, "PNG")
+
+                    # 复制到程序目录的 thumbnail 文件夹
+                    shutil.copy2(thumbnail_cloud_path, thumbnail_path)
+
+                    return thumbnail_cloud_path, thumbnail_path
                 except Exception as e:
                     print(f"生成缩略图失败: {e}")
-                    return ""
-        return ""
+                    return "", ""
+        return "", ""
+
 
 # ------------------ 可点击 QLabel ------------------
 class ClickableLabel(QLabel):
@@ -1346,25 +1626,99 @@ class ZoomableLabel(QLabel):
         
         self.setPixmap(pixmap_with_offset)
 
+class FixedPositionDialog(QDialog):
+    """
+    解决QDialog在左上角闪现问题的基类
+    所有需要避免闪现的Dialog都可以继承此类
+    """
+    def __init__(self, parent=None, offset=QPoint(0, 0)):
+        super().__init__(parent=parent)
+        self.offset = offset
+        self.main_window = parent
+        self._position_set = False
+        self._first_show = True
+        
+        # 关键：初始时设置窗口为不可见，并移到屏幕外
+        self.setWindowOpacity(0)  # 设置完全透明
+        self.move(-10000, -10000)  # 移到屏幕外
+        
+    def set_initial_position(self):
+        """在显示前设置初始位置"""
+        if self._position_set:
+            return
+            
+        if self.main_window:
+            main_geom = self.main_window.frameGeometry()
+            main_center = main_geom.center()
+            dialog_geom = self.frameGeometry()
+            dialog_geom.moveCenter(main_center)
+            self.move(dialog_geom.topLeft() + self.offset)
+        else:
+            # 如果没有父窗口，居中显示在屏幕上
+            screen = QApplication.primaryScreen().geometry()
+            self.move(screen.center() - self.rect().center() + self.offset)
+        
+        self._position_set = True
+    
+    def showEvent(self, event):
+        """重写showEvent，在显示前确保位置已设置"""
+        super().showEvent(event)
+        
+        if self._first_show:
+            self._first_show = False
+            # 确保位置已设置
+            if not self._position_set:
+                self.set_initial_position()
+            
+            # 延迟一帧后恢复可见性和透明度
+            QTimer.singleShot(1, self._make_visible)
+    
+    def _make_visible(self):
+        """使窗口可见"""
+        # 再次确认位置
+        if not self._position_set:
+            self.set_initial_position()
+        
+        # 恢复透明度，让窗口可见
+        self.setWindowOpacity(1.0)
+        
+    def exec_(self):
+        """重写exec_方法，显示前设置位置"""
+        self.set_initial_position()
+        return super().exec_()
+    
+    def show(self):
+        """重写show方法，显示前设置位置"""
+        self.set_initial_position()
+        super().show()
+
+
 class PreviewDialog(QDialog):
     def __init__(self, image_path, main_window=None, offset=QPoint(50, 50)):
-        super().__init__(parent=None)
+        # 先不调用父类，因为需要先计算窗口大小
+        QDialog.__init__(self, parent=None)  # 暂时使用QDialog的初始化
+        
         self.setWindowTitle("预览")
+        self.offset = offset
+        self.main_window = main_window
+        self._position_set = False
+        self._first_show = True
+
+        # 防止闪现
+        self.setWindowOpacity(0)
+        self.move(-10000, -10000)
         
         # 根据图片大小调整窗口大小
         pixmap = QPixmap(image_path)
         if not pixmap.isNull():
-            # 获取屏幕大小
             screen = QApplication.primaryScreen().geometry()
             max_width = int(screen.width() * 0.8)
             max_height = int(screen.height() * 0.8)
             
-            # 计算合适的窗口大小，保持图片比例
             img_width = pixmap.width()
             img_height = pixmap.height()
             
             if img_width > max_width or img_height > max_height:
-                # 需要缩放
                 scale_w = max_width / img_width
                 scale_h = max_height / img_height
                 scale = min(scale_w, scale_h)
@@ -1372,45 +1726,68 @@ class PreviewDialog(QDialog):
                 window_width = int(img_width * scale)
                 window_height = int(img_height * scale)
             else:
-                # 不需要缩放
                 window_width = img_width
                 window_height = img_height
             
-            # 设置最小尺寸
             window_width = max(300, window_width)
             window_height = max(200, window_height)
             
             self.resize(window_width, window_height)
         else:
-            # 如果图片加载失败，使用默认大小
             self.resize(800, 600)
         
+        #在resize之后立即设置位置
+        self.set_initial_position()
+        
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.offset = offset
-        self.main_window = main_window
         
         if main_window:
-            # 设置图标
             self.setWindowIcon(main_window.windowIcon())
-            # 在初始化阶段就设定位置
-            main_geom = main_window.frameGeometry()
-            main_center = main_geom.center()
-            dialog_geom = self.frameGeometry()
-            dialog_geom.moveCenter(main_center)
-            self.move(dialog_geom.topLeft() + self.offset)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)  # 移除边距让按钮可以贴边显示
+        layout.setContentsMargins(0, 0, 0, 0)
         
         self.label = ZoomableLabel(image_path)
         layout.addWidget(self.label)
         
-        # 连接图片改变信号来更新窗口标题
         self.label.imageChanged.connect(self.update_title)
         
-        # 设置焦点，使键盘事件生效
         self.setFocusPolicy(Qt.StrongFocus)
         self.label.setFocusPolicy(Qt.StrongFocus)
+    
+    def set_initial_position(self):
+        """设置初始位置"""
+        if self._position_set:
+            return
+        
+        if self.main_window:
+            main_geom = self.main_window.frameGeometry()
+            main_center = main_geom.center()
+            dialog_geom = self.frameGeometry()
+            dialog_geom.moveCenter(main_center)
+            self.move(dialog_geom.topLeft() + self.offset)
+        else:
+            screen = QApplication.primaryScreen().geometry()
+            self.move(screen.center() - self.rect().center() + self.offset)
+        
+        self._position_set = True
+
+    def showEvent(self, event):
+        """重写showEvent"""
+        super().showEvent(event)
+        
+        if self._first_show:
+            self._first_show = False
+            if not self._position_set:
+                self.set_initial_position()
+            QTimer.singleShot(1, self._make_visible)
+
+    def _make_visible(self):
+        """使窗口可见"""
+        if not self._position_set:
+            self.set_initial_position()
+        self.setWindowOpacity(1.0)
+        self.update_title(self.label.current_image_path)
     
     def update_title(self, image_path):
         """更新窗口标题显示当前图片名"""
@@ -1418,22 +1795,11 @@ class PreviewDialog(QDialog):
         current_index = self.label.current_index + 1
         total_images = len(self.label.image_list)
         self.setWindowTitle(f"预览 - {image_name} ({current_index}/{total_images})")
-        
-        # 图片改变时可能需要调整窗口大小，延迟更新按钮位置
         QTimer.singleShot(10, self.label.update_button_positions)
     
     def keyPressEvent(self, event):
         """将键盘事件转发给 ZoomableLabel"""
         self.label.keyPressEvent(event)
-    
-    def showEvent(self, event):
-        super().showEvent(event)
-        if self.main_window:
-            main_geom = self.main_window.frameGeometry()
-            main_center = main_geom.center()
-            dialog_geom = self.frameGeometry()
-            dialog_geom.moveCenter(main_center)
-            self.move(dialog_geom.topLeft() + self.offset)
         
         # 初始化标题
         self.update_title(self.label.current_image_path)
@@ -2273,6 +2639,7 @@ class FolderDatabaseApp(QMainWindow):
         
         self.folders_data = []  # 只存储数据，不创建widget
         self.stolen_img_link_data = {}
+        self.remark_watcher = None 
         
         self.init_ui()
         self.center_window()
@@ -2281,7 +2648,18 @@ class FolderDatabaseApp(QMainWindow):
         # self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         # 加载数据库
-        self.load_database()         
+        self.load_database()   
+
+        # 创建信号对象
+        self.sync_signals = SyncSignals()
+        
+        # 连接信号到槽函数
+        self.sync_signals.json_updated.connect(self.on_json_updated)
+        self.sync_signals.thumbnail_updated.connect(self.on_thumbnail_updated)
+        self.sync_signals.refresh_list.connect(self.refresh_folder_list)
+        
+        self.folder_sync_watcher = None
+        self.offline_sync_thread = None  
         
     def center_window(self):
         """窗口居中显示"""
@@ -2999,7 +3377,7 @@ class FolderDatabaseApp(QMainWindow):
     def import_product_info(self):
         """导入产品信息""" 
         # 创建对话框
-        dialog = QDialog(self)
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle("产品信息导入")
         dialog.setFixedSize(300, 100)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3177,7 +3555,7 @@ class FolderDatabaseApp(QMainWindow):
     #排序逻辑
     def show_sort_dialog(self):
         """弹出排序设置对话框并排序虚拟列表"""
-        dialog = QDialog(self)
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle("排序设置")
         dialog.setFixedSize(280, 350)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3330,7 +3708,7 @@ class FolderDatabaseApp(QMainWindow):
         else:
             app_config = {}
 
-        dialog = QDialog(self)
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle("生成举报邮件")
         dialog.setFixedSize(800, 600)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3466,7 +3844,7 @@ class FolderDatabaseApp(QMainWindow):
 
         def show_missing_attachments_dialog(missing_attachments, attachment_keys):
             """显示缺失附件的自定义对话框"""
-            missing_dialog = QDialog(dialog)
+            missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
             missing_dialog.setWindowTitle("附件检测结果")
             missing_dialog.setFixedSize(350, 270)
             missing_dialog.setWindowModality(Qt.ApplicationModal)
@@ -3926,7 +4304,7 @@ class FolderDatabaseApp(QMainWindow):
         if name not in self.stolen_img_link_data:
             self.stolen_img_link_data[name] = []
 
-        dialog = QDialog(self)
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle(f"添加绑定盗图链接 - {name}")
         dialog.setFixedWidth(500)
         main_layout = QVBoxLayout(dialog)
@@ -4010,15 +4388,14 @@ class FolderDatabaseApp(QMainWindow):
         auto_add_layout.addStretch()
         main_layout.addLayout(auto_add_layout)
 
-        # 剪切板监控相关变量
+        # 剪切板监控相关变量 - 使用信号机制实现即时响应
         clipboard = QApplication.clipboard()
-        last_clipboard_text = clipboard.text().strip()
-        clipboard_timer = QTimer()
-        clipboard_timer.setInterval(200)  # 每200ms检查一次剪切板
+        # 关键修改：初始化为空字符串，不读取当前剪贴板内容
+        # 这样即使第一次复制的内容和打开对话框前的内容相同，也能正常添加
+        last_clipboard_text = ""
         
-        # 如果配置中启用了自动添加，则启动监控
-        if auto_add_enabled:
-            clipboard_timer.start()
+        # 如果配置中启用了自动添加，准备监控
+        monitoring_enabled = auto_add_enabled
 
         # 刷新显示
         def refresh_links():
@@ -4106,41 +4483,50 @@ class FolderDatabaseApp(QMainWindow):
 
         paste_btn.clicked.connect(on_paste)
 
-        # 剪切板监控逻辑
-        def check_clipboard():
+        # 使用剪贴板的 dataChanged 信号实现即时监测（推荐方案）
+        def on_clipboard_changed():
             nonlocal last_clipboard_text
-            if auto_add_switch.isChecked():
+            if monitoring_enabled and auto_add_switch.isChecked():
                 current_text = clipboard.text().strip()
-                # 检查是否有新内容且不为空
+                # 检查是否有新内容且不为空且不同于上次
                 if current_text and current_text != last_clipboard_text:
+                    last_clipboard_text = current_text
                     # 简单验证是否为链接格式
                     if current_text.startswith(('http://', 'https://', 'www.')):
                         if add_link_to_list(current_text):
-                            # 可选：显示提示信息
-                            auto_add_label.setText(f"启用复制链接后自动添加 (已添加: {len(current_text) if len(current_text) <= 20 else current_text[:20] + '...'})")
-                            QTimer.singleShot(2000, lambda: auto_add_label.setText("启用复制链接后自动添加"))
-                    last_clipboard_text = current_text
+                            # 显示提示信息
+                            preview = current_text[:30] + '...' if len(current_text) > 30 else current_text
+                            auto_add_label.setText(f"✓ 已自动添加: {preview}")
+                            QTimer.singleShot(3000, lambda: auto_add_label.setText("复制链接后自动添加"))
 
-        clipboard_timer.timeout.connect(check_clipboard)
+        # 连接剪贴板变化信号 - 这是最快的监测方式
+        clipboard.dataChanged.connect(on_clipboard_changed)
 
         # 开关状态改变事件
         def on_auto_add_changed(state):
-            nonlocal last_clipboard_text
+            nonlocal last_clipboard_text, monitoring_enabled
             # 保存状态到配置文件
             self.config["auto_add_clipboard_links"] = state
             self.save_config()
             
+            monitoring_enabled = state
             if state:
-                last_clipboard_text = clipboard.text().strip()  # 重置基准
-                clipboard_timer.start()
+                # 关键修改：启用时不读取当前剪贴板，保持空字符串
+                # 这样用户下一次复制时必然会触发添加
+                last_clipboard_text = ""
+                auto_add_label.setText("复制链接后自动添加 (已启用)")
+                QTimer.singleShot(2000, lambda: auto_add_label.setText("复制链接后自动添加"))
             else:
-                clipboard_timer.stop()
+                auto_add_label.setText("复制链接后自动添加")
 
         auto_add_switch.toggled.connect(on_auto_add_changed)
 
-        # 对话框关闭时停止定时器
+        # 对话框关闭时断开信号连接
         def on_dialog_finished():
-            clipboard_timer.stop()
+            try:
+                clipboard.dataChanged.disconnect(on_clipboard_changed)
+            except:
+                pass
 
         dialog.finished.connect(on_dialog_finished)
 
@@ -4166,7 +4552,7 @@ class FolderDatabaseApp(QMainWindow):
         current_remark = folder_data.get("remark", "")
         
         # 创建备注编辑对话框
-        dialog = QDialog(self)
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle("编辑备注")
         dialog.setFixedSize(400, 300)
         dialog.setWindowModality(Qt.WindowModal)
@@ -4267,6 +4653,15 @@ class FolderDatabaseApp(QMainWindow):
                     if widget:
                         widget.set_thumbnail(pixmap)
                     break
+
+        # 复制到 thumbnail_cloud ----------
+        thumbnail_cloud_path = folder_data.get("thumbnail_cloud", "").strip()
+        if thumbnail_cloud_path:
+            try:
+                os.makedirs(os.path.dirname(thumbnail_cloud_path), exist_ok=True)
+                shutil.copy2(new_thumb_path, thumbnail_cloud_path)
+            except Exception as e:
+                print(f"复制缩略图到 thumbnail_cloud 失败: {e}")
 
     def _generate_thumbnail_from_image(self, image_path, folder_name):
         """根据用户选择的图片生成 400x400 缩略图 (主线程调用)"""
@@ -4628,14 +5023,15 @@ class FolderDatabaseApp(QMainWindow):
 
         self.scanner_thread = FolderScanner(folder_path, search_term, added_paths=self.added_folder_paths)
 
-        # 接收日期字段
+        # 接收字段值
         self.scanner_thread.folder_found.connect(
-            lambda name, path, thumb, remark, _, modify_date: self.add_folder_realtime({
+            lambda name, path, thumb, remark, add_date, modify_date, thumb_cloud: self.add_folder_realtime({
                 'name': name,
                 'path': path,
                 'thumbnail': thumb,
+                'thumbnail_cloud': thumb_cloud,
                 'remark': remark,
-                'add_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # 扫描时的时间
+                'add_date': add_date,
                 'modify_date': modify_date
             })
         )
@@ -4905,11 +5301,13 @@ class FolderDatabaseApp(QMainWindow):
         self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}）")
 
         self.database_load_finished = True
-        # self.save_database()
         
         # 显示性能统计
         stats = self.folder_list.get_performance_stats()
         print(f"[性能统计] 渲染次数: {stats['render_count']}, 缓存命中: {stats['cache_hits']}")
+
+        self.start_folder_offline_sync() #启用离线同步功能监听线程
+        self.start_folder_sync() #启用在线同步功能监听线程
   # -------------------- 以上为加载数据库逻辑 --------------------
 
     #保存数据库
@@ -4957,7 +5355,68 @@ class FolderDatabaseApp(QMainWindow):
         """显示更新对话框"""
         dialog = UpdateDialog(self, CURRENT_VERSION)
         dialog.exec_()
-    
+
+    #---------------以下是同步功能逻辑-------------------------------
+    def on_json_updated(self, folder_data, remark):
+        """处理 JSON 更新"""
+        folder_data["remark"] = remark
+        self.update_folder_field_value(folder_data, "modify_date")
+        
+        # 只更新这一项的 UI
+        self.update_single_folder_item(folder_data)
+
+    def on_thumbnail_updated(self, folder_data, pixmap):
+        """处理缩略图更新"""
+        for index, data in enumerate(self.folder_list.items_data):
+            if data == folder_data:
+                # 更新缓存
+                thumbnail_path = folder_data.get("thumbnail", "")
+                if thumbnail_path:
+                    self.folder_list.thumbnail_cache[thumbnail_path] = pixmap
+
+                # 更新可见 widget
+                widget = self.folder_list.visible_widgets.get(index)
+                if widget:
+                    widget.set_thumbnail(pixmap)
+                break
+
+    def update_single_folder_item(self, folder_data):
+        """只更新单个文件夹项的显示"""
+        for index, data in enumerate(self.folder_list.items_data):
+            if data == folder_data:
+                widget = self.folder_list.visible_widgets.get(index)
+                if widget:
+                    # 直接更新 remark 显示
+                    remark = folder_data.get('remark', '')
+                    widget.remark_label.setText(remark)
+                    
+                    # 更新 tooltip
+                    path = folder_data.get('path', '')
+                    tooltip = f"路径: {path}"
+                    if remark:
+                        tooltip += f"\n备注: {remark}"
+                    widget.setToolTip(tooltip)
+                break
+
+    # -------- 启动同步线程 --------
+    def start_folder_sync(self):
+        """启用在线同步线程"""
+        self.folder_sync_watcher = FolderSyncWatcher(
+            self.sync_signals, 
+            self.folders_data
+        )
+        self.folder_sync_watcher.start()
+
+    def start_folder_offline_sync(self):
+        """启用离线同步线程"""
+        self.offline_sync_thread = OfflineSyncThreadPool(
+            self.sync_signals,
+            self.folders_data,
+            self.update_folder_field_value
+        )
+        self.offline_sync_thread.start()
+    #---------------以上是同步功能逻辑-------------------------------
+
     # 关闭程序时保存数据库和配置
     def closeEvent(self, event):
         """程序关闭时保存数据库和配置"""
