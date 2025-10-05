@@ -3473,6 +3473,7 @@ class FolderDatabaseApp(QMainWindow):
         """导入产品信息""" 
         # 创建对话框
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+        dialog.hide()
         dialog.setWindowTitle("产品信息导入")
         dialog.setFixedSize(300, 100)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3651,6 +3652,7 @@ class FolderDatabaseApp(QMainWindow):
     def show_sort_dialog(self):
         """弹出排序设置对话框并排序虚拟列表"""
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+        dialog.hide()
         dialog.setWindowTitle("排序设置")
         dialog.setFixedSize(280, 350)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3804,6 +3806,7 @@ class FolderDatabaseApp(QMainWindow):
                 app_config = {}
 
             dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+            dialog.hide()
             dialog.setWindowTitle("生成举报邮件")
             dialog.setFixedSize(800, 600)
             dialog.setWindowModality(Qt.ApplicationModal)
@@ -3940,6 +3943,7 @@ class FolderDatabaseApp(QMainWindow):
             def show_missing_attachments_dialog(missing_attachments, attachment_keys):
                 """显示缺失附件的自定义对话框"""
                 missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+                missing_dialog.hide()
                 missing_dialog.setWindowTitle("附件检测结果")
                 missing_dialog.setFixedSize(350, 270)
                 missing_dialog.setWindowModality(Qt.ApplicationModal)
@@ -4400,6 +4404,7 @@ class FolderDatabaseApp(QMainWindow):
             self.stolen_img_link_data[name] = []
 
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+        dialog.hide()
         dialog.setWindowTitle(f"添加绑定盗图链接 - {name}")
         dialog.setFixedWidth(500)
         main_layout = QVBoxLayout(dialog)
@@ -4648,6 +4653,7 @@ class FolderDatabaseApp(QMainWindow):
         
         # 创建备注编辑对话框
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+        dialog.hide()
         dialog.setWindowTitle("编辑备注")
         dialog.setFixedSize(400, 300)
         dialog.setWindowModality(Qt.WindowModal)
@@ -5035,9 +5041,9 @@ class FolderDatabaseApp(QMainWindow):
     def select_proof_file(self):
         """选择原创摄影作品声明文件"""
         proof_file_path, _ = QFileDialog.getOpenFileName(
-            self, 
+            self,
             "选择原创摄影作品声明文件",
-            "",
+            "C:\\",  # 默认打开C盘
             "所有文件 (*.*)"
         )
         
@@ -5048,7 +5054,7 @@ class FolderDatabaseApp(QMainWindow):
             return True
         
         return False
-    
+
     def copy_subfolders_only(self, source_path, target_path):
         """只复制子文件夹，不复制文件"""
         try:
