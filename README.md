@@ -1,7 +1,7 @@
-# 仓库名称
+# ProdDB
 [![GitHub](https://img.shields.io/badge/-GitHub-181717?style=flat-square&logo=github)](https://github.com/lemon-o)
-[![Release](https://img.shields.io/github/v/release/lemon-o/仓库名称?include_prereleases&style=flat-square&color=#1F883D)](https://github.com/lemon-o/仓库名称/releases)
+[![Release](https://img.shields.io/github/v/release/lemon-o/ProdDB?include_prereleases&style=flat-square&color=#1F883D)](https://github.com/lemon-o/ProdDB/releases)
 ---
-这里简单概括项目功能
+这是一个产品图库数据库管理工具
 ---
-这里详细描述项目功能
+- 将所有产品图文件夹写入到数据库方便查找，也可以一键生成原图证明文件
