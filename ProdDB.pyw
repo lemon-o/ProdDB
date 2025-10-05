@@ -27,7 +27,7 @@ import threading
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.0.7" #版本号
+CURRENT_VERSION = "v1.0.8" #版本号
 
 
 
@@ -43,16 +43,19 @@ class SyncSignals(QObject):
     # 信号：刷新列表
     refresh_list = pyqtSignal()
 
+    # 信号：线程完成
+    offline_sync_finished = pyqtSignal()
+
 
 # =============== 在线同步 ===============
 class FolderSyncHandler(FileSystemEventHandler):
     """统一处理 JSON 和云端缩略图变化"""
-    def __init__(self, signals, folders_data, folder_data=None):
+    def __init__(self, signals, folders_data, monitored_paths):
         super().__init__()
         self.signals = signals
-        self.folders_data = folders_data  # 所有文件夹数据
-        self.folder_data = folder_data  # 特定文件夹（用于缩略图监听）
-
+        self.folders_data = folders_data
+        self.monitored_paths = monitored_paths  # 需要监听的路径集合
+        
     def on_created(self, event):
         self._handle_event(event)
 
@@ -62,11 +65,17 @@ class FolderSyncHandler(FileSystemEventHandler):
     def _handle_event(self, event):
         if event.is_directory:
             return
+        
         file_path = os.path.abspath(event.src_path)
-
-        # ----------- JSON 文件处理 -----------
+        
+        # 只处理在监听范围内的文件
+        if not self._is_monitored_file(file_path):
+            return
+        
+        # ---------- JSON 文件处理 ----------
         if file_path.lower().endswith("_产品信息.json"):
             try:
+                mtime = os.path.getmtime(file_path)
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 folder_name = data.get("name")
@@ -75,62 +84,142 @@ class FolderSyncHandler(FileSystemEventHandler):
                 # 找到对应的 folder_data
                 for folder_data in self.folders_data:
                     if folder_data.get("name") == folder_name:
-                        # 发送信号到主线程
-                        self.signals.json_updated.emit(folder_data, remark)
+                        # 判断是否已经处理过
+                        if folder_data.get("_last_json_mtime", 0) < mtime:
+                            folder_data["_last_json_mtime"] = mtime
+                            self.signals.json_updated.emit(folder_data, remark)
                         break
             except Exception as e:
                 print(f"[监听] JSON 处理失败: {e}")
             return
 
-        # ----------- 云端缩略图变化 -----------
-        if self.folder_data:
-            cloud_thumb_path = os.path.abspath(self.folder_data.get("thumbnail_cloud", ""))
-            local_thumb_path = self.folder_data.get("thumbnail", "")
+        # ---------- 云端缩略图处理 ----------
+        for folder_data in self.folders_data:
+            cloud_thumb_path = os.path.abspath(folder_data.get("thumbnail_cloud", ""))
+            local_thumb_path = folder_data.get("thumbnail", "")
+            
             if cloud_thumb_path and cloud_thumb_path == file_path and os.path.exists(cloud_thumb_path):
                 try:
-                    # 复制到本地 thumbnail
-                    shutil.copy2(cloud_thumb_path, local_thumb_path)
-
-                    # 加载新的 pixmap 并发送信号
-                    pixmap = QPixmap(local_thumb_path).scaled(
-                        70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
-                    )
-                    self.signals.thumbnail_updated.emit(self.folder_data, pixmap)
+                    mtime = os.path.getmtime(cloud_thumb_path)
+                    if folder_data.get("_last_thumb_mtime", 0) < mtime:
+                        shutil.copy2(cloud_thumb_path, local_thumb_path)
+                        pixmap = QPixmap(local_thumb_path).scaled(
+                            70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
+                        self.signals.thumbnail_updated.emit(folder_data, pixmap)
+                        folder_data["_last_thumb_mtime"] = mtime
                 except Exception as e:
                     print(f"[监听] 复制云端缩略图失败: {e}")
+                break  # 找到就退出
+    
+    def _is_monitored_file(self, file_path):
+        """检查文件是否在监听范围内"""
+        for path in self.monitored_paths:
+            if file_path.startswith(path):
+                return True
+        return False
 
 
 class FolderSyncWatcher(threading.Thread):
-    """统一监听线程，包含 JSON 和云端缩略图"""
+    """可停止、可重启、可更新 folders_data 的监听线程"""
     def __init__(self, signals, folders_data):
         super().__init__(daemon=True)
         self.signals = signals
         self.folders_data = folders_data
-        self.observer = Observer()
+        self._observer = None
+        self._stop_event = threading.Event()
+        self._restart_event = threading.Event()
+        self._lock = threading.Lock()
 
     def run(self):
-        # ---------- 监听每个 folder_data 的已修 JSON ----------
-        for folder_data in self.folders_data:
-            fixed_folder = os.path.join(folder_data["path"], "已修")
-            if os.path.exists(fixed_folder):
-                handler = FolderSyncHandler(self.signals, self.folders_data)
-                self.observer.schedule(handler, fixed_folder, recursive=False)
-
-        # ---------- 监听每个 folder_data 的 thumbnail_cloud ----------
-        for folder_data in self.folders_data:
-            cloud_thumb_path = folder_data.get("thumbnail_cloud")
-            if cloud_thumb_path and os.path.exists(cloud_thumb_path):
-                folder_dir = os.path.dirname(cloud_thumb_path)
-                handler = FolderSyncHandler(self.signals, self.folders_data, folder_data)
-                self.observer.schedule(handler, folder_dir, recursive=False)
-
-        self.observer.start()
+        """线程主循环"""
+        self._start_observer()
         try:
-            while True:
-                threading.Event().wait(1)
+            while not self._stop_event.is_set():
+                # 如果有重启请求
+                if self._restart_event.is_set():
+                    self._restart_event.clear()
+                    self._restart_observer()
+                threading.Event().wait(0.5)
         finally:
-            self.observer.stop()
-            self.observer.join()
+            self._stop_observer()
+            print("[在线同步] 监听线程已退出")
+
+    # ---------- Observer 控制 ----------
+    def _start_observer(self):
+        """启动 Observer - 方案3:监听共同父目录"""
+        with self._lock:
+            if self._observer:
+                return
+            
+            self._observer = Observer()
+            
+            # 收集所有需要监听的路径
+            monitored_paths = set()
+            all_folder_paths = []
+            
+            for folder_data in self.folders_data:
+                folder_path = folder_data["path"]
+                all_folder_paths.append(folder_path)
+                
+                # 添加 "已修" 文件夹
+                fixed_folder = os.path.join(folder_path, "已修")
+                if os.path.exists(fixed_folder):
+                    monitored_paths.add(os.path.abspath(fixed_folder))
+                
+                # 添加云端缩略图目录
+                cloud_thumb_path = folder_data.get("thumbnail_cloud")
+                if cloud_thumb_path and os.path.exists(cloud_thumb_path):
+                    monitored_paths.add(os.path.abspath(os.path.dirname(cloud_thumb_path)))
+            
+            # 找出共同父目录
+            if len(all_folder_paths) == 1:
+                common_parent = all_folder_paths[0]
+            elif len(all_folder_paths) > 1:
+                common_parent = os.path.commonpath(all_folder_paths)
+            else:
+                print("[在线同步] 没有可监听的文件夹")
+                return
+            
+            # 检查共同父目录是否存在
+            if not os.path.exists(common_parent):
+                print(f"[在线同步] 共同父目录不存在: {common_parent}")
+                return
+            
+            # 只监听一个父目录,递归监听
+            handler = FolderSyncHandler(self.signals, self.folders_data, monitored_paths)
+            self._observer.schedule(handler, common_parent, recursive=True)
+            
+            self._observer.start()
+            print(f"[在线同步] 启动 监听父目录: {common_parent}")
+            print(f"[在线同步] 覆盖 {len(monitored_paths)} 个监控路径")
+
+    def _stop_observer(self):
+        """停止 Observer"""
+        with self._lock:
+            if self._observer:
+                self._observer.stop()
+                self._observer.join()
+                self._observer = None
+                print("[在线同步] 线程已停止")
+
+    def _restart_observer(self):
+        """重启 Observer"""
+        print("[在线同步] 线程正在重启...")
+        self._stop_observer()
+        self._start_observer()
+
+    # ---------- 外部接口 ----------
+    def stop(self):
+        """停止线程"""
+        self._stop_event.set()
+
+    def request_restart(self, new_folders_data=None):
+        """请求线程重启监听,可更新 folders_data"""
+        if new_folders_data is not None:
+            with self._lock:
+                self.folders_data = new_folders_data
+        self._restart_event.set()
 
 
 # =============== 离线同步 ===============
@@ -147,9 +236,10 @@ def calculate_max_workers(task_type="io", factor=1.5):
     except Exception:
         return 4
 
-
 class OfflineSyncThreadPool(threading.Thread):
     """离线同步线程（线程池并行处理 JSON 和缩略图）"""
+    finished = pyqtSignal()
+
     def __init__(self, signals, folders_data, update_folder_field_value_func):
         super().__init__(daemon=True)
         self.signals = signals
@@ -160,17 +250,22 @@ class OfflineSyncThreadPool(threading.Thread):
     def run(self):
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = []
-                for folder_data in self.folders_data:
-                    futures.append(executor.submit(self.process_folder, folder_data))
-
-                # 等待所有任务完成
+                print(f"[离线同步] 启动线程池，最大线程数: {self.max_workers}")
+                futures = [executor.submit(self.process_folder, fd) for fd in self.folders_data]
                 for future in futures:
-                    future.result()
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"[离线同步] 线程执行异常: {e}")
+
+            print(f"[离线同步] 同步完毕")
+            QMetaObject.invokeMethod(self.signals, "offline_sync_finished", Qt.QueuedConnection)
+
         except Exception as e:
             print(f"[离线同步] 线程池异常: {e}")
 
     def process_folder(self, folder_data):
+        folder_name = folder_data.get("name", "未知")
         folder_changed = False
 
         # ---------- JSON 文件处理 ----------
@@ -181,15 +276,12 @@ class OfflineSyncThreadPool(threading.Thread):
             if os.path.exists(json_file):
                 try:
                     mtime = os.path.getmtime(json_file)
-                    if "_last_json_mtime" not in folder_data:
-                        folder_data["_last_json_mtime"] = mtime
-                    elif mtime > folder_data["_last_json_mtime"]:
+                    last_mtime = folder_data.get("_last_json_mtime", 0)
+                    if mtime > last_mtime:
                         with open(json_file, "r", encoding="utf-8") as f:
                             data = json.load(f)
                         remark = data.get("remark", "")
                         folder_data["_last_json_mtime"] = mtime
-                        
-                        # 发送信号到主线程更新
                         self.signals.json_updated.emit(folder_data, remark)
                         folder_changed = True
                 except Exception as e:
@@ -201,14 +293,12 @@ class OfflineSyncThreadPool(threading.Thread):
         if cloud_thumb and os.path.exists(cloud_thumb):
             try:
                 mtime = os.path.getmtime(cloud_thumb)
-                if "_last_thumb_mtime" not in folder_data:
-                    folder_data["_last_thumb_mtime"] = mtime
-                elif mtime > folder_data["_last_thumb_mtime"]:
+                last_thumb_mtime = folder_data.get("_last_thumb_mtime", 0)
+                if mtime > last_thumb_mtime:
                     os.makedirs(os.path.dirname(local_thumb), exist_ok=True)
                     shutil.copy2(cloud_thumb, local_thumb)
                     folder_data["_last_thumb_mtime"] = mtime
 
-                    # 加载 pixmap 并发送信号
                     pixmap = QPixmap(local_thumb).scaled(
                         70, 70, Qt.KeepAspectRatio, Qt.SmoothTransformation
                     )
@@ -217,6 +307,8 @@ class OfflineSyncThreadPool(threading.Thread):
             except Exception as e:
                 print(f"[离线同步] 复制缩略图失败: {e}")
 
+        if folder_changed:
+            print(f"{folder_name} 有更新")
 
 #---------------子线程 检查更新----------------------------------
 class CheckUpdateThread(QThread):
@@ -2652,15 +2744,18 @@ class FolderDatabaseApp(QMainWindow):
 
         # 创建信号对象
         self.sync_signals = SyncSignals()
+        self.watcher = FolderSyncWatcher(self.sync_signals, self.folders_data)
         
         # 连接信号到槽函数
         self.sync_signals.json_updated.connect(self.on_json_updated)
         self.sync_signals.thumbnail_updated.connect(self.on_thumbnail_updated)
         self.sync_signals.refresh_list.connect(self.refresh_folder_list)
+        self.sync_signals.offline_sync_finished.connect(self.on_offline_sync_finished)
         
         self.folder_sync_watcher = None
         self.offline_sync_thread = None  
-        
+        self.no_offline_sync_thread = True
+
     def center_window(self):
         """窗口居中显示"""
         screen = QApplication.desktop().screenGeometry()
@@ -3692,517 +3787,517 @@ class FolderDatabaseApp(QMainWindow):
 
     #生成举报邮件
     def generate_html_email(self):
-        """生成侵权举报 HTML 邮件"""
-        # 检查是否有至少一个文件夹有链接
-        has_links = any(links for links in self.stolen_img_link_data.values())
+            """生成侵权举报 HTML 邮件"""
+            # 检查是否有至少一个文件夹有链接
+            has_links = any(links for links in self.stolen_img_link_data.values())
 
-        if not self.stolen_img_link_data or not has_links:
-            QMessageBox.warning(self, "生成举报邮件", "请先右键列表项-【添加绑定盗图链接】添加绑定侵权链接")
-            return
-
-        # 读取配置
-        config_path = self.config_file
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                app_config = json.load(f)
-        else:
-            app_config = {}
-
-        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.setWindowTitle("生成举报邮件")
-        dialog.setFixedSize(800, 600)
-        dialog.setWindowModality(Qt.ApplicationModal)
-        
-        # 主水平布局
-        main_layout = QHBoxLayout(dialog)
-        
-        # 左侧垂直布局（控件区域）
-        left_layout = QVBoxLayout()
-        
-        # 右侧垂直布局（预览区域）
-        right_layout = QVBoxLayout()
-
-        # 权利人主体
-        reporter_groupbox = QGroupBox("权利人主体")
-        reporter_layout = QVBoxLayout(reporter_groupbox)
-        company_radio = QRadioButton("公司")
-        person_radio = QRadioButton("个人")
-        
-        # 从配置文件读取上次选择的选项
-        is_company = app_config.get("reporter_type", "company") == "company"
-        company_radio.setChecked(is_company)
-        person_radio.setChecked(not is_company)
-        
-        reporter_layout.addWidget(company_radio)
-        reporter_layout.addWidget(person_radio)
-        left_layout.addWidget(reporter_groupbox)
-
-        # 权利人信息
-        info_groupbox = QGroupBox("权利人信息")
-        info_layout = QFormLayout(info_groupbox)
-
-        company_edit = QLineEdit()
-        contact_edit = QLineEdit()
-        phone_edit = QLineEdit()
-        email_edit_input = QLineEdit()
-
-        # 设置 placeholder 并填充默认值
-        company_edit.setPlaceholderText("公司名称")
-        company_edit.setText(app_config.get("company_name", ""))
-
-        contact_edit.setPlaceholderText("联系人")
-        contact_edit.setText(app_config.get("contact_name", ""))
-
-        phone_edit.setPlaceholderText("电话")
-        phone_edit.setText(app_config.get("phone", ""))
-
-        email_edit_input.setPlaceholderText("邮箱")
-        email_edit_input.setText(app_config.get("email", ""))
-
-        # 直接添加控件，不用 Label
-        info_layout.addRow(company_edit)
-        info_layout.addRow(contact_edit)
-        info_layout.addRow(phone_edit)
-        info_layout.addRow(email_edit_input)
-
-        left_layout.addWidget(info_groupbox)
-
-        def toggle_company_fields():
-            company_edit.setVisible(company_radio.isChecked())
-
-            # 如果已经生成过邮件，切换选项时自动重新生成
-            if hasattr(dialog, 'email_generated') and dialog.email_generated:
-                build_email()
-
-        company_radio.toggled.connect(toggle_company_fields)
-        person_radio.toggled.connect(toggle_company_fields)
-        toggle_company_fields()
-
-        # 按钮
-        btn_layout = QHBoxLayout()
-        generate_btn = QPushButton("生成邮件")
-        copy_btn = QPushButton("复制HTML邮件")
-
-        btn_layout.addWidget(generate_btn)
-        btn_layout.addWidget(copy_btn)
-        left_layout.addLayout(btn_layout)
-        
-        # 附件名称
-        attachment_groupbox = QGroupBox("附件名称")
-        attachment_layout = QVBoxLayout(attachment_groupbox)
-        
-        attachment_edit = QTextEdit()
-        attachment_edit.setReadOnly(True)  # 设置为只读
-        attachment_layout.addWidget(attachment_edit)
-        
-        left_layout.addWidget(attachment_groupbox)
-        
-        # 右侧邮件预览
-        preview_groupbox = QGroupBox("邮件预览")
-        preview_layout = QVBoxLayout(preview_groupbox)
-        
-        email_preview = QTextEdit()
-        email_preview.setReadOnly(True)
-        preview_layout.addWidget(email_preview)
-        
-        right_layout.addWidget(preview_groupbox)
-        
-        # 将左右布局添加到主布局
-        main_layout.addLayout(left_layout, 1)  # 左侧占1份
-        main_layout.addLayout(right_layout, 2)  # 右侧占2份
-
-        # 用于存储原始HTML内容
-        dialog.html_content = ""
-        dialog.email_generated = False
-
-        def check_and_set_attachment_path():
-            """检查并设置附件路径"""
-            attachment_path = app_config.get("attachment_folder_path", "")
-            
-            if not attachment_path or not os.path.exists(attachment_path):
-                QMessageBox.information(dialog, "提示", "未设置附件检测路径，请点击【OK】后选择附件（原图证明文件）所在文件夹。\n若暂未生成过原图证明文件，请先指定一个文件夹用来存放附件（原图证明文件）")
-                # 弹出设置框设置附件路径
-                folder_path = QFileDialog.getExistingDirectory(dialog, "选择附件所在文件夹", "")
-                if folder_path:
-                    app_config["attachment_folder_path"] = folder_path
-                    self.config["attachment_folder_path"] = folder_path
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(app_config, f, ensure_ascii=False, indent=2)
-                    return folder_path
-                else:
-                    return None
-            return attachment_path
-
-        def check_missing_attachments(attachment_path, attachment_keys):
-            """检查缺失的附件"""
-            missing_attachments = []
-            for key in attachment_keys:
-                zip_file_path = os.path.join(attachment_path, f"{key}.zip")
-                if not os.path.exists(zip_file_path):
-                    missing_attachments.append(f"{key}.zip")
-            return missing_attachments
-
-        def show_missing_attachments_dialog(missing_attachments, attachment_keys):
-            """显示缺失附件的自定义对话框"""
-            missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-            missing_dialog.setWindowTitle("附件检测结果")
-            missing_dialog.setFixedSize(350, 270)
-            missing_dialog.setWindowModality(Qt.ApplicationModal)
-            
-            layout = QVBoxLayout(missing_dialog)
-            
-            # 标题
-            title_label = QLabel("以下附件不存在，是否生成附件（原图证明文件）？")
-            title_label.setWordWrap(True)
-            layout.addWidget(title_label)
-            
-            # 缺失附件列表
-            list_widget = QTextEdit()
-            list_widget.setReadOnly(True)
-            list_widget.setPlainText("\n".join(missing_attachments))
-            layout.addWidget(list_widget)
-            
-            # 按钮布局
-            button_layout = QHBoxLayout()
-            reselect_btn = QPushButton("重设附件路径")
-            generate_btn = QPushButton("生成")
-            ignore_btn = QPushButton("忽略")
-            
-            button_layout.addWidget(reselect_btn)
-            button_layout.addWidget(generate_btn)
-            button_layout.addWidget(ignore_btn)
-            layout.addLayout(button_layout)
-            
-            def reselect_path():
-                """重设附件路径"""
-                default_path = self.config.get("attachment_folder_path", "")
-                folder_path = QFileDialog.getExistingDirectory(
-                    missing_dialog, 
-                    "选择附件所在文件夹", 
-                    default_path
-                )
-                if folder_path:
-                    app_config["attachment_folder_path"] = folder_path
-                    self.config["attachment_folder_path"] = folder_path
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(app_config, f, ensure_ascii=False, indent=2)
-
-                    # 重新检测
-                    detect_missing(folder_path)
-
-            def detect_missing(folder_path):
-                """统一的缺失附件检测函数"""
-                new_missing = check_missing_attachments(folder_path, attachment_keys)
-                if new_missing:
-                    list_widget.setPlainText("\n".join(new_missing))
-                else:
-                    QMessageBox.information(missing_dialog, "提示", "所有附件都已存在！")
-                    missing_dialog.accept()
-                    
-            def generate_attachments():
-                """生成附件"""
-                missing_dialog.accept()
-                selected_data = []
-                for key in attachment_keys:
-                    if f"{key}.zip" in missing_attachments:
-                        for original_key, _ in self.stolen_img_link_data.items():
-                            if original_key == key:
-                                folder_path = self.get_folder_path_by_key(key)
-                                if folder_path:
-                                    selected_data.append({"path": folder_path})
-                                break
-
-                if selected_data:
-                    self.generate_original_proof(selected_data)
-                    # 重新检测
-                    detect_missing(folder_path)
-            
-            def ignore_missing():
-                """忽略缺失的附件"""
-                missing_dialog.reject()
-            
-            reselect_btn.clicked.connect(reselect_path)
-            generate_btn.clicked.connect(generate_attachments)
-            ignore_btn.clicked.connect(ignore_missing)
-            
-            return missing_dialog.exec_()
-
-        def check_attachments_after_copy():
-            """复制成功后检测附件"""
-            # 获取当前的附件keys
-            attachment_keys = [key for key, links in self.stolen_img_link_data.items() if links]
-            
-            if not attachment_keys:
-                return
-            
-            # 检查并设置附件路径
-            attachment_path = check_and_set_attachment_path()
-            if not attachment_path:
-                return
-            
-            # 检查缺失的附件
-            missing_attachments = check_missing_attachments(attachment_path, attachment_keys)
-            
-            if missing_attachments:
-                show_missing_attachments_dialog(missing_attachments, attachment_keys)
-
-        def build_email():
-            # 校验必填信息
-            if company_radio.isChecked() and not company_edit.text().strip():
-                QMessageBox.warning(dialog, "提示", "请填写公司名称")
-                return
-            if not contact_edit.text().strip():
-                QMessageBox.warning(dialog, "提示", "请填写联系人")
-                return
-            if not phone_edit.text().strip():
-                QMessageBox.warning(dialog, "提示", "请填写电话")
-                return
-            if not email_edit_input.text().strip():
-                QMessageBox.warning(dialog, "提示", "请填写邮箱")
+            if not self.stolen_img_link_data or not has_links:
+                QMessageBox.warning(self, "生成举报邮件", "请先右键列表项-【添加绑定盗图链接】添加绑定侵权链接")
                 return
 
-            main_body = "本人" if person_radio.isChecked() else "本公司"
-            company_name = company_edit.text() if company_radio.isChecked() else ""
-            contact = contact_edit.text()
-            phone = phone_edit.text()
-            email_addr = email_edit_input.text()
-            signature_name = contact if person_radio.isChecked() else company_name
-
-            # 保存输入到配置，包括选项类型
-            reporter_type = "person" if person_radio.isChecked() else "company"
-            app_config.update({
-                "reporter_type": reporter_type,
-                "company_name": company_edit.text(),
-                "contact_name": contact_edit.text(),
-                "phone": phone_edit.text(),
-                "email": email_addr
-            })
-            
-            # 同时更新主配置对象，避免程序关闭时被覆盖
-            self.config.update({
-                "reporter_type": reporter_type,
-                "company_name": company_edit.text(),
-                "contact_name": contact_edit.text(),
-                "phone": phone_edit.text(),
-                "email": email_addr
-            })
-            
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(app_config, f, ensure_ascii=False, indent=2)
-
-            # 构造侵权链接 HTML
-            links_html = ""
-            for key, urls in self.stolen_img_link_data.items():
-                for url in urls:
-                    links_html += f'<div class="links" style="background-color: rgb(249, 249, 249); padding: 12px; border-left: 4px solid rgb(254, 172, 28); margin: 12px 0px; word-break: break-all; font-family: &quot;Microsoft YaHei&quot;, sans-serif; font-size: 14px; border-radius: 3px;"><span>{url} 证明材料附件名称：{key}</span></div>\n'
-
-            # 根据选择的类型决定是否显示公司名称
-            company_info_html = ""
-            if company_radio.isChecked():
-                company_info_html = f"公司名称：{company_name}<br>"
-
-            # 原始 HTML 模板，保持不变
-            html_content = f"""<div style="clear: both;"></div><meta charset="UTF-8"><div style="clear: both;">
-                    </div><title>产品图片侵权通知</title><div style="clear: both;">
-                    </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: #fff; overflow: hidden; padding: 0px; font-family: 'Microsoft YaHei', sans-serif;">
-                    <div class="content" style="padding: 0px 0px 20px;">
-
-                        <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
-
-                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">本公司发现以下商品未经授权使用了本公司拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对涉案侵权商品在<strong>所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理</strong>。</p>
-
-                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">本公司的产品摄影图原图及相关证明材料见附件。</p>
-
-                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权产品：</strong></p>
-                        {links_html}
-
-                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
-                        <ul style="padding-left: 20px; margin: 10px 0px;">
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本公司是上述产品图片的版权所有者。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">经核实，涉案商品在多个站点均由同一销售主体或关联账户运营，并且商品信息、图片完全一致，构成全平台范围的系统性侵权。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本公司真诚地相信，上述商品中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本通知中的信息真实准确。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">在作伪证将承担法律责任的前提下，本公司声明本公司是版权所有者。</li>
-                        </ul>
-
-                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>本公司要求：</strong></p>
-                        <ul style="padding-left: 20px; margin: 10px 0px;">
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">Temu 平台应立即对涉案侵权商品在所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理，而非仅限单一站点。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">对相关卖家进行处罚，并建立拦截机制，防止该商品在其他站点再次上架。</li>
-                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">若 Temu 仅对部分站点处理，而继续允许其他站点销售侵权商品，则属于明知侵权仍纵容传播，本公司将保留进一步追究 Temu 平台连带责任的权利，包括但不限于向国家知识产权局、工商管理部门以及境外监管机构投诉，直至提起诉讼。</li>
-                        </ul>
-
-                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>权利人信息：</strong></p>
-                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">
-                            {company_info_html}联系人：{contact}<br>
-                            电话：{phone}<br>
-                            邮箱：<a href="mailto:{email_addr}" style="color: #FEAC1C; text-decoration: none;">{email_addr}</a>
-                        </p>
-
-                        <div class="signature" style="margin-top: 20px;">
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">签名：{signature_name}</p>
-                        </div>
-
-                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">感谢贵单位的支持和协助！</p>
-
-                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">此致<br>敬礼</p>
-
-                    </div>
-                    </div>"""
-
-            # 保存原始HTML内容用于复制
-            dialog.html_content = html_content
-            dialog.email_generated = True
-
-            #生成附件压缩包名称
-            attachments = ' '.join(
-                f'"{key}.zip"' 
-                for key, links in self.stolen_img_link_data.items() 
-                if links  # 只保留非空列表
-            )
-
-            # 显示在附件列表中
-            attachment_edit.setText(attachments)
-            
-            # 在预览面板显示渲染的HTML
-            email_preview.setHtml(html_content)
-
-        def copy_email():
-            if not dialog.html_content:
-                QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
-                return
-
-            clipboard = QApplication.clipboard()
-            clipboard.setText(dialog.html_content)
-            
-            # 检查配置文件里是否已经设置过
-            no_prompt = app_config.get("no_email_copy_prompt", False)
-
-            if no_prompt:
-                # 在主窗口中心显示放大的提示
-                show_large_tooltip(dialog, "✓\n已复制")
+            # 读取配置
+            config_path = self.config_file
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    app_config = json.load(f)
             else:
-                # 显示带勾选框的消息框
-                msg_box = QMessageBox(dialog)
-                msg_box.setWindowTitle("提示")
-                msg_box.setText("举报邮件HTML代码已复制到剪贴板，请切换邮箱编辑界面为【源码】模式粘贴")
-                msg_box.setIcon(QMessageBox.Information)
-                
-                # 添加不再提示勾选框
-                no_prompt_cb = QCheckBox("不再提示")
-                msg_box.setCheckBox(no_prompt_cb)
-                
-                # 显示消息框
-                msg_box.exec_()
-                
-                # 如果勾选了不再提示，保存到配置文件
-                if no_prompt_cb.isChecked():
-                    self.no_email_copy_prompt = True
-                    app_config["no_email_copy_prompt"] = True
-                    self.config["no_email_copy_prompt"] = True
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(app_config, f, ensure_ascii=False, indent=2)
+                app_config = {}
 
+            dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+            dialog.setWindowTitle("生成举报邮件")
+            dialog.setFixedSize(800, 600)
+            dialog.setWindowModality(Qt.ApplicationModal)
+            
+            # 主水平布局
+            main_layout = QHBoxLayout(dialog)
+            
+            # 左侧垂直布局（控件区域）
+            left_layout = QVBoxLayout()
+            
+            # 右侧垂直布局（预览区域）
+            right_layout = QVBoxLayout()
+
+            # 权利人主体
+            reporter_groupbox = QGroupBox("权利人主体")
+            reporter_layout = QVBoxLayout(reporter_groupbox)
+            company_radio = QRadioButton("公司")
+            person_radio = QRadioButton("个人")
+            
+            # 从配置文件读取上次选择的选项
+            is_company = app_config.get("reporter_type", "company") == "company"
+            company_radio.setChecked(is_company)
+            person_radio.setChecked(not is_company)
+            
+            reporter_layout.addWidget(company_radio)
+            reporter_layout.addWidget(person_radio)
+            left_layout.addWidget(reporter_groupbox)
+
+            # 权利人信息
+            info_groupbox = QGroupBox("权利人信息")
+            info_layout = QFormLayout(info_groupbox)
+
+            company_edit = QLineEdit()
+            contact_edit = QLineEdit()
+            phone_edit = QLineEdit()
+            email_edit_input = QLineEdit()
+
+            # 设置 placeholder 并填充默认值
+            company_edit.setPlaceholderText("公司名称")
+            company_edit.setText(app_config.get("company_name", ""))
+
+            contact_edit.setPlaceholderText("联系人")
+            contact_edit.setText(app_config.get("contact_name", ""))
+
+            phone_edit.setPlaceholderText("电话")
+            phone_edit.setText(app_config.get("phone", ""))
+
+            email_edit_input.setPlaceholderText("邮箱")
+            email_edit_input.setText(app_config.get("email", ""))
+
+            # 直接添加控件，不用 Label
+            info_layout.addRow(company_edit)
+            info_layout.addRow(contact_edit)
+            info_layout.addRow(phone_edit)
+            info_layout.addRow(email_edit_input)
+
+            left_layout.addWidget(info_groupbox)
+
+            def toggle_company_fields():
+                company_edit.setVisible(company_radio.isChecked())
+
+                # 如果已经生成过邮件，切换选项时自动重新生成
+                if hasattr(dialog, 'email_generated') and dialog.email_generated:
+                    build_email()
+
+            company_radio.toggled.connect(toggle_company_fields)
+            person_radio.toggled.connect(toggle_company_fields)
+            toggle_company_fields()
+
+            # 按钮
+            btn_layout = QHBoxLayout()
+            generate_btn = QPushButton("生成邮件")
+            copy_btn = QPushButton("复制HTML邮件")
+
+            btn_layout.addWidget(generate_btn)
+            btn_layout.addWidget(copy_btn)
+            left_layout.addLayout(btn_layout)
+            
+            # 附件名称
+            attachment_groupbox = QGroupBox("附件名称")
+            attachment_layout = QVBoxLayout(attachment_groupbox)
+            
+            attachment_edit = QTextEdit()
+            attachment_edit.setReadOnly(True)  # 设置为只读
+            attachment_layout.addWidget(attachment_edit)
+            
+            left_layout.addWidget(attachment_groupbox)
+            
+            # 右侧邮件预览
+            preview_groupbox = QGroupBox("邮件预览")
+            preview_layout = QVBoxLayout(preview_groupbox)
+            
+            email_preview = QTextEdit()
+            email_preview.setReadOnly(True)
+            preview_layout.addWidget(email_preview)
+            
+            right_layout.addWidget(preview_groupbox)
+            
+            # 将左右布局添加到主布局
+            main_layout.addLayout(left_layout, 1)  # 左侧占1份
+            main_layout.addLayout(right_layout, 2)  # 右侧占2份
+
+            # 用于存储原始HTML内容
+            dialog.html_content = ""
+            dialog.email_generated = False
+
+            def check_and_set_attachment_path():
+                """检查并设置附件路径"""
+                attachment_path = app_config.get("attachment_folder_path", "")
+                
+                if not attachment_path or not os.path.exists(attachment_path):
+                    QMessageBox.information(dialog, "提示", "未设置附件检测路径，请点击【OK】后选择附件（原图证明文件）所在文件夹。\n若暂未生成过原图证明文件，请先指定一个文件夹用来存放附件（原图证明文件）")
+                    # 弹出设置框设置附件路径
+                    folder_path = QFileDialog.getExistingDirectory(dialog, "选择附件所在文件夹", "")
+                    if folder_path:
+                        app_config["attachment_folder_path"] = folder_path
+                        self.config["attachment_folder_path"] = folder_path
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            json.dump(app_config, f, ensure_ascii=False, indent=2)
+                        return folder_path
+                    else:
+                        return None
+                return attachment_path
+
+            def check_missing_attachments(attachment_path, attachment_keys):
+                """检查缺失的附件"""
+                missing_attachments = []
+                for key in attachment_keys:
+                    zip_file_path = os.path.join(attachment_path, f"{key}.zip")
+                    if not os.path.exists(zip_file_path):
+                        missing_attachments.append(f"{key}.zip")
+                return missing_attachments
+
+            def show_missing_attachments_dialog(missing_attachments, attachment_keys):
+                """显示缺失附件的自定义对话框"""
+                missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+                missing_dialog.setWindowTitle("附件检测结果")
+                missing_dialog.setFixedSize(350, 270)
+                missing_dialog.setWindowModality(Qt.ApplicationModal)
+                
+                layout = QVBoxLayout(missing_dialog)
+                
+                # 标题
+                title_label = QLabel("以下附件不存在，是否生成附件（原图证明文件）？")
+                title_label.setWordWrap(True)
+                layout.addWidget(title_label)
+                
+                # 缺失附件列表
+                list_widget = QTextEdit()
+                list_widget.setReadOnly(True)
+                list_widget.setPlainText("\n".join(missing_attachments))
+                layout.addWidget(list_widget)
+                
+                # 按钮布局
+                button_layout = QHBoxLayout()
+                reselect_btn = QPushButton("重设附件路径")
+                generate_btn = QPushButton("生成")
+                ignore_btn = QPushButton("忽略")
+                
+                button_layout.addWidget(reselect_btn)
+                button_layout.addWidget(generate_btn)
+                button_layout.addWidget(ignore_btn)
+                layout.addLayout(button_layout)
+                
+                def reselect_path():
+                    """重设附件路径"""
+                    default_path = self.config.get("attachment_folder_path", "")
+                    folder_path = QFileDialog.getExistingDirectory(
+                        missing_dialog, 
+                        "选择附件所在文件夹", 
+                        default_path
+                    )
+                    if folder_path:
+                        app_config["attachment_folder_path"] = folder_path
+                        self.config["attachment_folder_path"] = folder_path
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            json.dump(app_config, f, ensure_ascii=False, indent=2)
+
+                        # 重新检测
+                        detect_missing(folder_path)
+
+                def detect_missing(folder_path):
+                    """统一的缺失附件检测函数"""
+                    new_missing = check_missing_attachments(folder_path, attachment_keys)
+                    if new_missing:
+                        list_widget.setPlainText("\n".join(new_missing))
+                    else:
+                        QMessageBox.information(missing_dialog, "提示", "所有附件都已存在！")
+                        missing_dialog.accept()
+                        
+                def generate_attachments():
+                    """生成附件"""
+                    missing_dialog.accept()
+                    selected_data = []
+                    for key in attachment_keys:
+                        if f"{key}.zip" in missing_attachments:
+                            for original_key, _ in self.stolen_img_link_data.items():
+                                if original_key == key:
+                                    folder_path = self.get_folder_path_by_key(key)
+                                    if folder_path:
+                                        selected_data.append({"path": folder_path})
+                                    break
+
+                    if selected_data:
+                        self.generate_original_proof(selected_data)
+                        # 重新检测
+                        detect_missing(folder_path)
+                
+                def ignore_missing():
+                    """忽略缺失的附件"""
+                    missing_dialog.reject()
+                
+                reselect_btn.clicked.connect(reselect_path)
+                generate_btn.clicked.connect(generate_attachments)
+                ignore_btn.clicked.connect(ignore_missing)
+                
+                return missing_dialog.exec_()
+
+            def check_attachments_after_copy():
+                """复制成功后检测附件"""
+                # 获取当前的附件keys
+                attachment_keys = [key for key, links in self.stolen_img_link_data.items() if links]
+                
+                if not attachment_keys:
+                    return
+                
+                # 检查并设置附件路径
+                attachment_path = check_and_set_attachment_path()
+                if not attachment_path:
+                    return
+                
+                # 检查缺失的附件
+                missing_attachments = check_missing_attachments(attachment_path, attachment_keys)
+                
+                if missing_attachments:
+                    show_missing_attachments_dialog(missing_attachments, attachment_keys)
+
+            def build_email():
+                # 校验必填信息
+                if company_radio.isChecked() and not company_edit.text().strip():
+                    QMessageBox.warning(dialog, "提示", "请填写公司名称")
+                    return
+                if not contact_edit.text().strip():
+                    QMessageBox.warning(dialog, "提示", "请填写联系人")
+                    return
+                if not phone_edit.text().strip():
+                    QMessageBox.warning(dialog, "提示", "请填写电话")
+                    return
+                if not email_edit_input.text().strip():
+                    QMessageBox.warning(dialog, "提示", "请填写邮箱")
+                    return
+
+                main_body = "本人" if person_radio.isChecked() else "本公司"
+                company_name = company_edit.text() if company_radio.isChecked() else ""
+                contact = contact_edit.text()
+                phone = phone_edit.text()
+                email_addr = email_edit_input.text()
+                signature_name = contact if person_radio.isChecked() else company_name
+
+                # 保存输入到配置，包括选项类型
+                reporter_type = "person" if person_radio.isChecked() else "company"
+                app_config.update({
+                    "reporter_type": reporter_type,
+                    "company_name": company_edit.text(),
+                    "contact_name": contact_edit.text(),
+                    "phone": phone_edit.text(),
+                    "email": email_addr
+                })
+                
+                # 同时更新主配置对象，避免程序关闭时被覆盖
+                self.config.update({
+                    "reporter_type": reporter_type,
+                    "company_name": company_edit.text(),
+                    "contact_name": contact_edit.text(),
+                    "phone": phone_edit.text(),
+                    "email": email_addr
+                })
+                
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(app_config, f, ensure_ascii=False, indent=2)
+
+                # 构造侵权链接 HTML - 修复链接识别问题
+                links_html = ""
+                for key, urls in self.stolen_img_link_data.items():
+                    for url in urls:
+                        links_html += f'<div class="links" style="background-color: rgb(249, 249, 249); padding: 12px; border-left: 4px solid rgb(254, 172, 28); margin: 12px 0px; word-break: break-all; font-family: &quot;Microsoft YaHei&quot;, sans-serif; font-size: 14px; border-radius: 3px;"><a href="{url}" style="color: #0066cc; text-decoration: underline;">{url}</a> 证明材料附件名称：{key}</div>\n'
+
+                # 根据选择的类型决定是否显示公司名称
+                company_info_html = ""
+                if company_radio.isChecked():
+                    company_info_html = f"公司名称：{company_name}<br>"
+
+                # 原始 HTML 模板 - 使用动态称谓
+                html_content = f"""<div style="clear: both;"></div><meta charset="UTF-8"><div style="clear: both;">
+                        </div><title>产品图片侵权通知</title><div style="clear: both;">
+                        </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: #fff; overflow: hidden; padding: 0px; font-family: 'Microsoft YaHei', sans-serif;">
+                        <div class="content" style="padding: 0px 0px 20px;">
+
+                            <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
+
+                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}发现以下商品未经授权使用了{main_body}拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对涉案侵权商品在<strong>所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理</strong>。</p>
+
+                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}的产品摄影图原图及相关证明材料见附件。</p>
+
+                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权产品：</strong></p>
+                            {links_html}
+
+                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
+                            <ul style="padding-left: 20px; margin: 10px 0px;">
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}是上述产品图片的版权所有者。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">经核实，涉案商品在多个站点均由同一销售主体或关联账户运营，并且商品信息、图片完全一致，构成全平台范围的系统性侵权。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}真诚地相信，上述商品中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本通知中的信息真实准确。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">在作伪证将承担法律责任的前提下，{main_body}声明{main_body}是版权所有者。</li>
+                            </ul>
+
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>{main_body}要求：</strong></p>
+                            <ul style="padding-left: 20px; margin: 10px 0px;">
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">Temu 平台应立即对涉案侵权商品在所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理，而非仅限单一站点。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">对相关卖家进行处罚，并建立拦截机制，防止该商品在其他站点再次上架。</li>
+                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">若 Temu 仅对部分站点处理，而继续允许其他站点销售侵权商品，则属于明知侵权仍纵容传播，{main_body}将保留进一步追究 Temu 平台连带责任的权利，包括但不限于向国家知识产权局、工商管理部门以及境外监管机构投诉，直至提起诉讼。</li>
+                            </ul>
+
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>权利人信息：</strong></p>
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">
+                                {company_info_html}联系人：{contact}<br>
+                                电话：{phone}<br>
+                                邮箱：<a href="mailto:{email_addr}" style="color: #FEAC1C; text-decoration: none;">{email_addr}</a>
+                            </p>
+
+                            <div class="signature" style="margin-top: 20px;">
+                                <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">签名：{signature_name}</p>
+                            </div>
+
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">感谢贵单位的支持和协助！</p>
+
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">此致<br>敬礼</p>
+
+                        </div>
+                        </div>"""
+
+                # 保存原始HTML内容用于复制
+                dialog.html_content = html_content
+                dialog.email_generated = True
+
+                #生成附件压缩包名称
+                attachments = ' '.join(
+                    f'"{key}.zip"' 
+                    for key, links in self.stolen_img_link_data.items() 
+                    if links  # 只保留非空列表
+                )
+
+                # 显示在附件列表中
+                attachment_edit.setText(attachments)
+                
+                # 在预览面板显示渲染的HTML
+                email_preview.setHtml(html_content)
+
+            def copy_email():
+                if not dialog.html_content:
+                    QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
+                    return
+
+                clipboard = QApplication.clipboard()
+                clipboard.setText(dialog.html_content)
+                
+                # 检查配置文件里是否已经设置过
+                no_prompt = app_config.get("no_email_copy_prompt", False)
+
+                if no_prompt:
                     # 在主窗口中心显示放大的提示
                     show_large_tooltip(dialog, "✓\n已复制")
+                else:
+                    # 显示带勾选框的消息框
+                    msg_box = QMessageBox(dialog)
+                    msg_box.setWindowTitle("提示")
+                    msg_box.setText("举报邮件HTML代码已复制到剪贴板，请切换邮箱编辑界面为【源码】模式粘贴")
+                    msg_box.setIcon(QMessageBox.Information)
+                    
+                    # 添加不再提示勾选框
+                    no_prompt_cb = QCheckBox("不再提示")
+                    msg_box.setCheckBox(no_prompt_cb)
+                    
+                    # 显示消息框
+                    msg_box.exec_()
+                    
+                    # 如果勾选了不再提示，保存到配置文件
+                    if no_prompt_cb.isChecked():
+                        self.no_email_copy_prompt = True
+                        app_config["no_email_copy_prompt"] = True
+                        self.config["no_email_copy_prompt"] = True
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            json.dump(app_config, f, ensure_ascii=False, indent=2)
 
-        def copy_name():
-            clipboard = QApplication.clipboard()
-            attachments = ' '.join(
-                f'"{key}.zip"' 
-                for key, links in self.stolen_img_link_data.items() 
-                if links  # 只保留非空列表
-            )
-            clipboard.setText(attachments)
-            show_small_tooltip(attachment_edit, "✓\n已复制")
+                        # 在主窗口中心显示放大的提示
+                        show_large_tooltip(dialog, "✓\n已复制")
+
+            def copy_name():
+                clipboard = QApplication.clipboard()
+                attachments = ' '.join(
+                    f'"{key}.zip"' 
+                    for key, links in self.stolen_img_link_data.items() 
+                    if links  # 只保留非空列表
+                )
+                clipboard.setText(attachments)
+                show_small_tooltip(attachment_edit, "✓\n已复制")
+                
+                # 复制成功后检测附件
+                QTimer.singleShot(100, check_attachments_after_copy)  # 延迟100ms执行，确保提示先显示
+
+            def show_small_tooltip(parent, text):
+                """在控件中心显示小提示"""
+                tooltip = QLabel(parent)
+                tooltip.setAlignment(Qt.AlignCenter)
+                tooltip.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(200, 200, 200, 150);
+                        border-radius: 10px;
+                        padding: 10px;
+                        font: bold 12px;
+                        min-width: 50px;
+                        min-height: 50px;
+                    }
+                """)
+                tooltip.setText(text)
+                tooltip.adjustSize()
+                
+                # 居中显示
+                x = (parent.width() - tooltip.width()) // 2
+                y = (parent.height() - tooltip.height()) // 2
+                tooltip.move(x, y)
+                tooltip.show()
+                
+                # 2秒后自动消失
+                QTimer.singleShot(2000, tooltip.deleteLater)
+
+            def show_large_tooltip(parent, text):
+                """在主窗口中心显示大提示"""
+                tooltip = QLabel(parent)
+                tooltip.setAlignment(Qt.AlignCenter)
+                tooltip.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(200, 200, 200, 200);
+                        border-radius: 15px;
+                        padding: 20px;
+                        font: bold 20px;
+                        min-width: 100px;
+                        min-height: 100px;
+                    }
+                """)
+                tooltip.setText(text)
+                tooltip.adjustSize()
+                
+                # 居中显示
+                x = (parent.width() - tooltip.width()) // 2
+                y = (parent.height() - tooltip.height()) // 2
+                tooltip.move(x, y)
+                tooltip.show()
+                
+                # 2秒后自动消失
+                QTimer.singleShot(2000, tooltip.deleteLater)
+
+            generate_btn.clicked.connect(build_email)
+            copy_btn.clicked.connect(copy_email)
             
-            # 复制成功后检测附件
-            QTimer.singleShot(100, check_attachments_after_copy)  # 延迟100ms执行，确保提示先显示
-
-        def show_small_tooltip(parent, text):
-            """在控件中心显示小提示"""
-            tooltip = QLabel(parent)
-            tooltip.setAlignment(Qt.AlignCenter)
-            tooltip.setStyleSheet("""
-                QLabel {
-                    background-color: rgba(200, 200, 200, 150);
-                    border-radius: 10px;
-                    padding: 10px;
-                    font: bold 12px;
-                    min-width: 50px;
-                    min-height: 50px;
-                }
-            """)
-            tooltip.setText(text)
-            tooltip.adjustSize()
+            # 设置附件名称框的点击事件
+            def on_attachment_edit_click(event):
+                if dialog.email_generated:
+                    copy_name()
+                else:
+                    QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
+                event.accept()
             
-            # 居中显示
-            x = (parent.width() - tooltip.width()) // 2
-            y = (parent.height() - tooltip.height()) // 2
-            tooltip.move(x, y)
-            tooltip.show()
+            attachment_edit.mousePressEvent = on_attachment_edit_click
             
-            # 2秒后自动消失
-            QTimer.singleShot(2000, tooltip.deleteLater)
-
-        def show_large_tooltip(parent, text):
-            """在主窗口中心显示大提示"""
-            tooltip = QLabel(parent)
-            tooltip.setAlignment(Qt.AlignCenter)
-            tooltip.setStyleSheet("""
-                QLabel {
-                    background-color: rgba(200, 200, 200, 200);
-                    border-radius: 15px;
-                    padding: 20px;
-                    font: bold 20px;
-                    min-width: 100px;
-                    min-height: 100px;
-                }
-            """)
-            tooltip.setText(text)
-            tooltip.adjustSize()
+            # 检查是否所有信息都已从配置文件加载成功，如果是则自动生成邮件
+            auto_generate = all([
+                app_config.get("company_name") or app_config.get("reporter_type") == "person",
+                app_config.get("contact_name"),
+                app_config.get("phone"),
+                app_config.get("email")
+            ])
             
-            # 居中显示
-            x = (parent.width() - tooltip.width()) // 2
-            y = (parent.height() - tooltip.height()) // 2
-            tooltip.move(x, y)
-            tooltip.show()
-            
-            # 2秒后自动消失
-            QTimer.singleShot(2000, tooltip.deleteLater)
+            if auto_generate:
+                build_email()
 
-        generate_btn.clicked.connect(build_email)
-        copy_btn.clicked.connect(copy_email)
-        
-        # 设置附件名称框的点击事件
-        def on_attachment_edit_click(event):
-            if dialog.email_generated:
-                copy_name()
-            else:
-                QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
-            event.accept()
-        
-        attachment_edit.mousePressEvent = on_attachment_edit_click
-        
-        # 检查是否所有信息都已从配置文件加载成功，如果是则自动生成邮件
-        auto_generate = all([
-            app_config.get("company_name") or app_config.get("reporter_type") == "person",
-            app_config.get("contact_name"),
-            app_config.get("phone"),
-            app_config.get("email")
-        ])
-        
-        if auto_generate:
-            build_email()
+            # 给子窗口安装 closeEvent
+            def on_close(event):
+                self.stolen_img_link_data = {}
+                event.accept()
 
-        # 给子窗口安装 closeEvent
-        def on_close(event):
-            self.stolen_img_link_data = {}
-            event.accept()
+            dialog.closeEvent = on_close  # 覆盖 closeEvent
 
-        dialog.closeEvent = on_close  # 覆盖 closeEvent
-
-        dialog.exec_()
+            dialog.exec_()
 
     # 需要添加的辅助方法
     def get_folder_path_by_key(self, key):
@@ -4920,12 +5015,12 @@ class FolderDatabaseApp(QMainWindow):
     
     def open_template_file(self):
         """打开原创摄影作品声明模板文件"""
-        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "原创摄影作品声明模板.png").replace('/', '\\')
+        template_path = os.path.join(os.getcwd(), "原创摄影作品声明模板.png").replace('/', '\\')
         
         if not os.path.exists(template_path):
             QMessageBox.warning(self, "文件不存在", f"模板文件不存在: {template_path}")
             return
-        
+     
         try:
             system = platform.system()
             if system == "Windows":
@@ -5077,7 +5172,12 @@ class FolderDatabaseApp(QMainWindow):
         QMessageBox.information(self, "扫描完成", msg)
         self.total_num = self.total_num + found_count
         self.status_label.setText(f"<span style='color: #00d26a;'>●</span> 就绪 （总计：{self.total_num}） ")
-        self.save_database()
+        if self.no_offline_sync_thread:
+            self.start_folder_offline_sync() #启用离线同步功能  
+
+        # 传入最新的 folders_data 给 watcher
+        self.restart_sync_watcher(new_folders_data=self.folders_data)
+
   # -------------------- 以上为扫描逻辑 --------------------
 
     #搜索文件夹
@@ -5306,8 +5406,9 @@ class FolderDatabaseApp(QMainWindow):
         stats = self.folder_list.get_performance_stats()
         print(f"[性能统计] 渲染次数: {stats['render_count']}, 缓存命中: {stats['cache_hits']}")
 
-        self.start_folder_offline_sync() #启用离线同步功能监听线程
         self.start_folder_sync() #启用在线同步功能监听线程
+        if self.no_offline_sync_thread:
+            self.start_folder_offline_sync() #启用离线同步功能
   # -------------------- 以上为加载数据库逻辑 --------------------
 
     #保存数据库
@@ -5398,7 +5499,42 @@ class FolderDatabaseApp(QMainWindow):
                     widget.setToolTip(tooltip)
                 break
 
-    # -------- 启动同步线程 --------
+    def on_offline_sync_finished(self):
+        self.no_offline_sync_thread = True
+        self.save_database()
+
+    # 重启在线同步线程
+    def restart_sync_watcher(self, new_folders_data=None):
+        """
+        安全启动或重启 watcher
+        """
+        if not hasattr(self, "watcher") or self.watcher is None:
+            # 第一次创建线程
+            self.watcher = FolderSyncWatcher(self.sync_signals, self.folders_data)
+            if new_folders_data is not None:
+                self.watcher.folders_data = new_folders_data
+            self.watcher.start()
+        elif not self.watcher.is_alive():
+            if new_folders_data is not None:
+                self.watcher.folders_data = new_folders_data
+            self.watcher.start()
+        else:
+            # 已经在运行，直接请求重启
+            if new_folders_data is not None:
+                self.watcher.folders_data = new_folders_data
+            self.watcher.request_restart(new_folders_data)
+            print("[主线程] watcher 请求重启")
+
+
+    # 停止在线同步线程
+    def stop_sync_watcher(self):
+        if self.watcher:
+            print("[主线程] 请求停止同步线程")
+            self.watcher.stop()
+            self.watcher.join()
+            self.watcher = None
+
+    # -------- 启动在线同步线程 --------
     def start_folder_sync(self):
         """启用在线同步线程"""
         self.folder_sync_watcher = FolderSyncWatcher(
@@ -5407,6 +5543,7 @@ class FolderDatabaseApp(QMainWindow):
         )
         self.folder_sync_watcher.start()
 
+    # -------- 启动离线同步线程 --------
     def start_folder_offline_sync(self):
         """启用离线同步线程"""
         self.offline_sync_thread = OfflineSyncThreadPool(
@@ -5415,6 +5552,7 @@ class FolderDatabaseApp(QMainWindow):
             self.update_folder_field_value
         )
         self.offline_sync_thread.start()
+        self.no_offline_sync_thread = False
     #---------------以上是同步功能逻辑-------------------------------
 
     # 关闭程序时保存数据库和配置
