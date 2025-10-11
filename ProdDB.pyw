@@ -24,10 +24,11 @@ from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import threading
+import re
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.0.8" #版本号
+CURRENT_VERSION = "v1.0.9" #版本号
 
 
 
@@ -309,6 +310,32 @@ class OfflineSyncThreadPool(threading.Thread):
 
         if folder_changed:
             print(f"{folder_name} 有更新")
+
+
+#---------------子线程获取 goods_id----------------------------------
+class GoodsIdThread(QThread):
+    result_signal = pyqtSignal(str, str)  # link, goods_id
+
+    def __init__(self, link):
+        super().__init__()
+        self.link = link
+
+    def run(self):
+        goods_id = None
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.head(self.link, headers=headers, allow_redirects=True, timeout=3)
+            final_url = r.url
+            m = re.search(r'goods_id[\'"]?\s*[:=]\s*["\']?(\d+)', final_url)
+            if m:
+                goods_id = m.group(1)
+            else:
+                m2 = re.search(r'-g-(\d+)\.html', final_url)
+                if m2:
+                    goods_id = m2.group(1)
+        except Exception as e:
+            print(f"[GoodsIdThread] 获取 goods_id 失败: {e}")
+        self.result_signal.emit(self.link, goods_id or "")
 
 #---------------子线程 检查更新----------------------------------
 class CheckUpdateThread(QThread):
@@ -3547,7 +3574,7 @@ class FolderDatabaseApp(QMainWindow):
         import_btn.clicked.connect(import_from_template)
         
         # 显示对话框
-        dialog.exec_()
+        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
 
     def start_imort(self, file_path):
         """开始导入"""
@@ -3746,7 +3773,7 @@ class FolderDatabaseApp(QMainWindow):
         cancel_btn.clicked.connect(dialog.reject)
 
         # 显示窗口
-        dialog.exec_() 
+        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
 
     #统一排序函数
     def sort_folders(self):
@@ -3789,519 +3816,539 @@ class FolderDatabaseApp(QMainWindow):
 
     #生成举报邮件
     def generate_html_email(self):
-            """生成侵权举报 HTML 邮件"""
-            # 检查是否有至少一个文件夹有链接
-            has_links = any(links for links in self.stolen_img_link_data.values())
+        """生成侵权举报 HTML 邮件"""
+        # 检查是否有至少一个文件夹有链接
+        has_links = any(links for links in self.stolen_img_link_data.values())
 
-            if not self.stolen_img_link_data or not has_links:
-                QMessageBox.warning(self, "生成举报邮件", "请先右键列表项-【添加绑定盗图链接】添加绑定侵权链接")
-                return
+        if not self.stolen_img_link_data or not has_links:
+            QMessageBox.warning(self, "生成举报邮件", "请先右键列表项-【添加绑定盗图链接】添加绑定侵权链接")
+            return
 
-            # 读取配置
-            config_path = self.config_file
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    app_config = json.load(f)
-            else:
-                app_config = {}
+        # 读取配置
+        config_path = self.config_file
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                app_config = json.load(f)
+        else:
+            app_config = {}
 
-            dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-            dialog.hide()
-            dialog.setWindowTitle("生成举报邮件")
-            dialog.setFixedSize(800, 600)
-            dialog.setWindowModality(Qt.ApplicationModal)
-            
-            # 主水平布局
-            main_layout = QHBoxLayout(dialog)
-            
-            # 左侧垂直布局（控件区域）
-            left_layout = QVBoxLayout()
-            
-            # 右侧垂直布局（预览区域）
-            right_layout = QVBoxLayout()
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+        dialog.hide()
+        dialog.setWindowTitle("生成举报邮件")
+        dialog.setFixedSize(800, 600)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        
+        # 主水平布局
+        main_layout = QHBoxLayout(dialog)
+        
+        # 左侧垂直布局（控件区域）
+        left_layout = QVBoxLayout()
+        
+        # 右侧垂直布局（预览区域）
+        right_layout = QVBoxLayout()
 
-            # 权利人主体
-            reporter_groupbox = QGroupBox("权利人主体")
-            reporter_layout = QVBoxLayout(reporter_groupbox)
-            company_radio = QRadioButton("公司")
-            person_radio = QRadioButton("个人")
-            
-            # 从配置文件读取上次选择的选项
-            is_company = app_config.get("reporter_type", "company") == "company"
-            company_radio.setChecked(is_company)
-            person_radio.setChecked(not is_company)
-            
-            reporter_layout.addWidget(company_radio)
-            reporter_layout.addWidget(person_radio)
-            left_layout.addWidget(reporter_groupbox)
+        # 权利人主体
+        reporter_groupbox = QGroupBox("权利人主体")
+        reporter_layout = QVBoxLayout(reporter_groupbox)
+        company_radio = QRadioButton("公司")
+        person_radio = QRadioButton("个人")
+        
+        # 从配置文件读取上次选择的选项
+        is_company = app_config.get("reporter_type", "company") == "company"
+        company_radio.setChecked(is_company)
+        person_radio.setChecked(not is_company)
+        
+        reporter_layout.addWidget(company_radio)
+        reporter_layout.addWidget(person_radio)
+        left_layout.addWidget(reporter_groupbox)
 
-            # 权利人信息
-            info_groupbox = QGroupBox("权利人信息")
-            info_layout = QFormLayout(info_groupbox)
+        # 权利人信息
+        info_groupbox = QGroupBox("权利人信息")
+        info_layout = QFormLayout(info_groupbox)
 
-            company_edit = QLineEdit()
-            contact_edit = QLineEdit()
-            phone_edit = QLineEdit()
-            email_edit_input = QLineEdit()
+        company_edit = QLineEdit()
+        contact_edit = QLineEdit()
+        phone_edit = QLineEdit()
+        email_edit_input = QLineEdit()
 
-            # 设置 placeholder 并填充默认值
-            company_edit.setPlaceholderText("公司名称")
-            company_edit.setText(app_config.get("company_name", ""))
+        # 设置 placeholder 并填充默认值
+        company_edit.setPlaceholderText("公司名称")
+        company_edit.setText(app_config.get("company_name", ""))
 
-            contact_edit.setPlaceholderText("联系人")
-            contact_edit.setText(app_config.get("contact_name", ""))
+        contact_edit.setPlaceholderText("联系人")
+        contact_edit.setText(app_config.get("contact_name", ""))
 
-            phone_edit.setPlaceholderText("电话")
-            phone_edit.setText(app_config.get("phone", ""))
+        phone_edit.setPlaceholderText("电话")
+        phone_edit.setText(app_config.get("phone", ""))
 
-            email_edit_input.setPlaceholderText("邮箱")
-            email_edit_input.setText(app_config.get("email", ""))
+        email_edit_input.setPlaceholderText("邮箱")
+        email_edit_input.setText(app_config.get("email", ""))
 
-            # 直接添加控件，不用 Label
-            info_layout.addRow(company_edit)
-            info_layout.addRow(contact_edit)
-            info_layout.addRow(phone_edit)
-            info_layout.addRow(email_edit_input)
+        # 直接添加控件，不用 Label
+        info_layout.addRow(company_edit)
+        info_layout.addRow(contact_edit)
+        info_layout.addRow(phone_edit)
+        info_layout.addRow(email_edit_input)
 
-            left_layout.addWidget(info_groupbox)
+        left_layout.addWidget(info_groupbox)
 
-            def toggle_company_fields():
-                company_edit.setVisible(company_radio.isChecked())
+        def toggle_company_fields():
+            company_edit.setVisible(company_radio.isChecked())
 
-                # 如果已经生成过邮件，切换选项时自动重新生成
-                if hasattr(dialog, 'email_generated') and dialog.email_generated:
-                    build_email()
-
-            company_radio.toggled.connect(toggle_company_fields)
-            person_radio.toggled.connect(toggle_company_fields)
-            toggle_company_fields()
-
-            # 按钮
-            btn_layout = QHBoxLayout()
-            generate_btn = QPushButton("生成邮件")
-            copy_btn = QPushButton("复制HTML邮件")
-
-            btn_layout.addWidget(generate_btn)
-            btn_layout.addWidget(copy_btn)
-            left_layout.addLayout(btn_layout)
-            
-            # 附件名称
-            attachment_groupbox = QGroupBox("附件名称")
-            attachment_layout = QVBoxLayout(attachment_groupbox)
-            
-            attachment_edit = QTextEdit()
-            attachment_edit.setReadOnly(True)  # 设置为只读
-            attachment_layout.addWidget(attachment_edit)
-            
-            left_layout.addWidget(attachment_groupbox)
-            
-            # 右侧邮件预览
-            preview_groupbox = QGroupBox("邮件预览")
-            preview_layout = QVBoxLayout(preview_groupbox)
-            
-            email_preview = QTextEdit()
-            email_preview.setReadOnly(True)
-            preview_layout.addWidget(email_preview)
-            
-            right_layout.addWidget(preview_groupbox)
-            
-            # 将左右布局添加到主布局
-            main_layout.addLayout(left_layout, 1)  # 左侧占1份
-            main_layout.addLayout(right_layout, 2)  # 右侧占2份
-
-            # 用于存储原始HTML内容
-            dialog.html_content = ""
-            dialog.email_generated = False
-
-            def check_and_set_attachment_path():
-                """检查并设置附件路径"""
-                attachment_path = app_config.get("attachment_folder_path", "")
-                
-                if not attachment_path or not os.path.exists(attachment_path):
-                    QMessageBox.information(dialog, "提示", "未设置附件检测路径，请点击【OK】后选择附件（原图证明文件）所在文件夹。\n若暂未生成过原图证明文件，请先指定一个文件夹用来存放附件（原图证明文件）")
-                    # 弹出设置框设置附件路径
-                    folder_path = QFileDialog.getExistingDirectory(dialog, "选择附件所在文件夹", "")
-                    if folder_path:
-                        app_config["attachment_folder_path"] = folder_path
-                        self.config["attachment_folder_path"] = folder_path
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            json.dump(app_config, f, ensure_ascii=False, indent=2)
-                        return folder_path
-                    else:
-                        return None
-                return attachment_path
-
-            def check_missing_attachments(attachment_path, attachment_keys):
-                """检查缺失的附件"""
-                missing_attachments = []
-                for key in attachment_keys:
-                    zip_file_path = os.path.join(attachment_path, f"{key}.zip")
-                    if not os.path.exists(zip_file_path):
-                        missing_attachments.append(f"{key}.zip")
-                return missing_attachments
-
-            def show_missing_attachments_dialog(missing_attachments, attachment_keys):
-                """显示缺失附件的自定义对话框"""
-                missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-                missing_dialog.hide()
-                missing_dialog.setWindowTitle("附件检测结果")
-                missing_dialog.setFixedSize(350, 270)
-                missing_dialog.setWindowModality(Qt.ApplicationModal)
-                
-                layout = QVBoxLayout(missing_dialog)
-                
-                # 标题
-                title_label = QLabel("以下附件不存在，是否生成附件（原图证明文件）？")
-                title_label.setWordWrap(True)
-                layout.addWidget(title_label)
-                
-                # 缺失附件列表
-                list_widget = QTextEdit()
-                list_widget.setReadOnly(True)
-                list_widget.setPlainText("\n".join(missing_attachments))
-                layout.addWidget(list_widget)
-                
-                # 按钮布局
-                button_layout = QHBoxLayout()
-                reselect_btn = QPushButton("重设附件路径")
-                generate_btn = QPushButton("生成")
-                ignore_btn = QPushButton("忽略")
-                
-                button_layout.addWidget(reselect_btn)
-                button_layout.addWidget(generate_btn)
-                button_layout.addWidget(ignore_btn)
-                layout.addLayout(button_layout)
-                
-                def reselect_path():
-                    """重设附件路径"""
-                    default_path = self.config.get("attachment_folder_path", "")
-                    folder_path = QFileDialog.getExistingDirectory(
-                        missing_dialog, 
-                        "选择附件所在文件夹", 
-                        default_path
-                    )
-                    if folder_path:
-                        app_config["attachment_folder_path"] = folder_path
-                        self.config["attachment_folder_path"] = folder_path
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            json.dump(app_config, f, ensure_ascii=False, indent=2)
-
-                        # 重新检测
-                        detect_missing(folder_path)
-
-                def detect_missing(folder_path):
-                    """统一的缺失附件检测函数"""
-                    new_missing = check_missing_attachments(folder_path, attachment_keys)
-                    if new_missing:
-                        list_widget.setPlainText("\n".join(new_missing))
-                    else:
-                        QMessageBox.information(missing_dialog, "提示", "所有附件都已存在！")
-                        missing_dialog.accept()
-                        
-                def generate_attachments():
-                    """生成附件"""
-                    missing_dialog.accept()
-                    selected_data = []
-                    for key in attachment_keys:
-                        if f"{key}.zip" in missing_attachments:
-                            for original_key, _ in self.stolen_img_link_data.items():
-                                if original_key == key:
-                                    folder_path = self.get_folder_path_by_key(key)
-                                    if folder_path:
-                                        selected_data.append({"path": folder_path})
-                                    break
-
-                    if selected_data:
-                        self.generate_original_proof(selected_data)
-                        # 重新检测
-                        detect_missing(folder_path)
-                
-                def ignore_missing():
-                    """忽略缺失的附件"""
-                    missing_dialog.reject()
-                
-                reselect_btn.clicked.connect(reselect_path)
-                generate_btn.clicked.connect(generate_attachments)
-                ignore_btn.clicked.connect(ignore_missing)
-                
-                return missing_dialog.exec_()
-
-            def check_attachments_after_copy():
-                """复制成功后检测附件"""
-                # 获取当前的附件keys
-                attachment_keys = [key for key, links in self.stolen_img_link_data.items() if links]
-                
-                if not attachment_keys:
-                    return
-                
-                # 检查并设置附件路径
-                attachment_path = check_and_set_attachment_path()
-                if not attachment_path:
-                    return
-                
-                # 检查缺失的附件
-                missing_attachments = check_missing_attachments(attachment_path, attachment_keys)
-                
-                if missing_attachments:
-                    show_missing_attachments_dialog(missing_attachments, attachment_keys)
-
-            def build_email():
-                # 校验必填信息
-                if company_radio.isChecked() and not company_edit.text().strip():
-                    QMessageBox.warning(dialog, "提示", "请填写公司名称")
-                    return
-                if not contact_edit.text().strip():
-                    QMessageBox.warning(dialog, "提示", "请填写联系人")
-                    return
-                if not phone_edit.text().strip():
-                    QMessageBox.warning(dialog, "提示", "请填写电话")
-                    return
-                if not email_edit_input.text().strip():
-                    QMessageBox.warning(dialog, "提示", "请填写邮箱")
-                    return
-
-                main_body = "本人" if person_radio.isChecked() else "本公司"
-                company_name = company_edit.text() if company_radio.isChecked() else ""
-                contact = contact_edit.text()
-                phone = phone_edit.text()
-                email_addr = email_edit_input.text()
-                signature_name = contact if person_radio.isChecked() else company_name
-
-                # 保存输入到配置，包括选项类型
-                reporter_type = "person" if person_radio.isChecked() else "company"
-                app_config.update({
-                    "reporter_type": reporter_type,
-                    "company_name": company_edit.text(),
-                    "contact_name": contact_edit.text(),
-                    "phone": phone_edit.text(),
-                    "email": email_addr
-                })
-                
-                # 同时更新主配置对象，避免程序关闭时被覆盖
-                self.config.update({
-                    "reporter_type": reporter_type,
-                    "company_name": company_edit.text(),
-                    "contact_name": contact_edit.text(),
-                    "phone": phone_edit.text(),
-                    "email": email_addr
-                })
-                
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(app_config, f, ensure_ascii=False, indent=2)
-
-                # 构造侵权链接 HTML - 修复链接识别问题
-                links_html = ""
-                for key, urls in self.stolen_img_link_data.items():
-                    for url in urls:
-                        links_html += f'<div class="links" style="background-color: rgb(249, 249, 249); padding: 12px; border-left: 4px solid rgb(254, 172, 28); margin: 12px 0px; word-break: break-all; font-family: &quot;Microsoft YaHei&quot;, sans-serif; font-size: 14px; border-radius: 3px;"><a href="{url}" style="color: #0066cc; text-decoration: underline;">{url}</a> 证明材料附件名称：{key}</div>\n'
-
-                # 根据选择的类型决定是否显示公司名称
-                company_info_html = ""
-                if company_radio.isChecked():
-                    company_info_html = f"公司名称：{company_name}<br>"
-
-                # 原始 HTML 模板 - 使用动态称谓
-                html_content = f"""<div style="clear: both;"></div><meta charset="UTF-8"><div style="clear: both;">
-                        </div><title>产品图片侵权通知</title><div style="clear: both;">
-                        </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: #fff; overflow: hidden; padding: 0px; font-family: 'Microsoft YaHei', sans-serif;">
-                        <div class="content" style="padding: 0px 0px 20px;">
-
-                            <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
-
-                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}发现以下商品未经授权使用了{main_body}拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对涉案侵权商品在<strong>所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理</strong>。</p>
-
-                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}的产品摄影图原图及相关证明材料见附件。</p>
-
-                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权产品：</strong></p>
-                            {links_html}
-
-                            <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
-                            <ul style="padding-left: 20px; margin: 10px 0px;">
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}是上述产品图片的版权所有者。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">经核实，涉案商品在多个站点均由同一销售主体或关联账户运营，并且商品信息、图片完全一致，构成全平台范围的系统性侵权。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}真诚地相信，上述商品中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本通知中的信息真实准确。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">在作伪证将承担法律责任的前提下，{main_body}声明{main_body}是版权所有者。</li>
-                            </ul>
-
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>{main_body}要求：</strong></p>
-                            <ul style="padding-left: 20px; margin: 10px 0px;">
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">Temu 平台应立即对涉案侵权商品在所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理，而非仅限单一站点。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">对相关卖家进行处罚，并建立拦截机制，防止该商品在其他站点再次上架。</li>
-                                <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">若 Temu 仅对部分站点处理，而继续允许其他站点销售侵权商品，则属于明知侵权仍纵容传播，{main_body}将保留进一步追究 Temu 平台连带责任的权利，包括但不限于向国家知识产权局、工商管理部门以及境外监管机构投诉，直至提起诉讼。</li>
-                            </ul>
-
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>权利人信息：</strong></p>
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">
-                                {company_info_html}联系人：{contact}<br>
-                                电话：{phone}<br>
-                                邮箱：<a href="mailto:{email_addr}" style="color: #FEAC1C; text-decoration: none;">{email_addr}</a>
-                            </p>
-
-                            <div class="signature" style="margin-top: 20px;">
-                                <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">签名：{signature_name}</p>
-                            </div>
-
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">感谢贵单位的支持和协助！</p>
-
-                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">此致<br>敬礼</p>
-
-                        </div>
-                        </div>"""
-
-                # 保存原始HTML内容用于复制
-                dialog.html_content = html_content
-                dialog.email_generated = True
-
-                #生成附件压缩包名称
-                attachments = ' '.join(
-                    f'"{key}.zip"' 
-                    for key, links in self.stolen_img_link_data.items() 
-                    if links  # 只保留非空列表
-                )
-
-                # 显示在附件列表中
-                attachment_edit.setText(attachments)
-                
-                # 在预览面板显示渲染的HTML
-                email_preview.setHtml(html_content)
-
-            def copy_email():
-                if not dialog.html_content:
-                    QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
-                    return
-
-                clipboard = QApplication.clipboard()
-                clipboard.setText(dialog.html_content)
-                
-                # 检查配置文件里是否已经设置过
-                no_prompt = app_config.get("no_email_copy_prompt", False)
-
-                if no_prompt:
-                    # 在主窗口中心显示放大的提示
-                    show_large_tooltip(dialog, "✓\n已复制")
-                else:
-                    # 显示带勾选框的消息框
-                    msg_box = QMessageBox(dialog)
-                    msg_box.setWindowTitle("提示")
-                    msg_box.setText("举报邮件HTML代码已复制到剪贴板，请切换邮箱编辑界面为【源码】模式粘贴")
-                    msg_box.setIcon(QMessageBox.Information)
-                    
-                    # 添加不再提示勾选框
-                    no_prompt_cb = QCheckBox("不再提示")
-                    msg_box.setCheckBox(no_prompt_cb)
-                    
-                    # 显示消息框
-                    msg_box.exec_()
-                    
-                    # 如果勾选了不再提示，保存到配置文件
-                    if no_prompt_cb.isChecked():
-                        self.no_email_copy_prompt = True
-                        app_config["no_email_copy_prompt"] = True
-                        self.config["no_email_copy_prompt"] = True
-                        with open(config_path, "w", encoding="utf-8") as f:
-                            json.dump(app_config, f, ensure_ascii=False, indent=2)
-
-                        # 在主窗口中心显示放大的提示
-                        show_large_tooltip(dialog, "✓\n已复制")
-
-            def copy_name():
-                clipboard = QApplication.clipboard()
-                attachments = ' '.join(
-                    f'"{key}.zip"' 
-                    for key, links in self.stolen_img_link_data.items() 
-                    if links  # 只保留非空列表
-                )
-                clipboard.setText(attachments)
-                show_small_tooltip(attachment_edit, "✓\n已复制")
-                
-                # 复制成功后检测附件
-                QTimer.singleShot(100, check_attachments_after_copy)  # 延迟100ms执行，确保提示先显示
-
-            def show_small_tooltip(parent, text):
-                """在控件中心显示小提示"""
-                tooltip = QLabel(parent)
-                tooltip.setAlignment(Qt.AlignCenter)
-                tooltip.setStyleSheet("""
-                    QLabel {
-                        background-color: rgba(200, 200, 200, 150);
-                        border-radius: 10px;
-                        padding: 10px;
-                        font: bold 12px;
-                        min-width: 50px;
-                        min-height: 50px;
-                    }
-                """)
-                tooltip.setText(text)
-                tooltip.adjustSize()
-                
-                # 居中显示
-                x = (parent.width() - tooltip.width()) // 2
-                y = (parent.height() - tooltip.height()) // 2
-                tooltip.move(x, y)
-                tooltip.show()
-                
-                # 2秒后自动消失
-                QTimer.singleShot(2000, tooltip.deleteLater)
-
-            def show_large_tooltip(parent, text):
-                """在主窗口中心显示大提示"""
-                tooltip = QLabel(parent)
-                tooltip.setAlignment(Qt.AlignCenter)
-                tooltip.setStyleSheet("""
-                    QLabel {
-                        background-color: rgba(200, 200, 200, 200);
-                        border-radius: 15px;
-                        padding: 20px;
-                        font: bold 20px;
-                        min-width: 100px;
-                        min-height: 100px;
-                    }
-                """)
-                tooltip.setText(text)
-                tooltip.adjustSize()
-                
-                # 居中显示
-                x = (parent.width() - tooltip.width()) // 2
-                y = (parent.height() - tooltip.height()) // 2
-                tooltip.move(x, y)
-                tooltip.show()
-                
-                # 2秒后自动消失
-                QTimer.singleShot(2000, tooltip.deleteLater)
-
-            generate_btn.clicked.connect(build_email)
-            copy_btn.clicked.connect(copy_email)
-            
-            # 设置附件名称框的点击事件
-            def on_attachment_edit_click(event):
-                if dialog.email_generated:
-                    copy_name()
-                else:
-                    QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
-                event.accept()
-            
-            attachment_edit.mousePressEvent = on_attachment_edit_click
-            
-            # 检查是否所有信息都已从配置文件加载成功，如果是则自动生成邮件
-            auto_generate = all([
-                app_config.get("company_name") or app_config.get("reporter_type") == "person",
-                app_config.get("contact_name"),
-                app_config.get("phone"),
-                app_config.get("email")
-            ])
-            
-            if auto_generate:
+            # 如果已经生成过邮件，切换选项时自动重新生成
+            if hasattr(dialog, 'email_generated') and dialog.email_generated:
                 build_email()
 
-            # 给子窗口安装 closeEvent
-            def on_close(event):
-                self.stolen_img_link_data = {}
-                event.accept()
+        company_radio.toggled.connect(toggle_company_fields)
+        person_radio.toggled.connect(toggle_company_fields)
+        toggle_company_fields()
 
-            dialog.closeEvent = on_close  # 覆盖 closeEvent
+        # 按钮
+        btn_layout = QHBoxLayout()
+        generate_btn = QPushButton("生成邮件")
+        copy_btn = QPushButton("复制HTML邮件")
 
-            dialog.exec_()
+        btn_layout.addWidget(generate_btn)
+        btn_layout.addWidget(copy_btn)
+        left_layout.addLayout(btn_layout)
+        
+        # 附件名称
+        attachment_groupbox = QGroupBox("附件名称")
+        attachment_layout = QVBoxLayout(attachment_groupbox)
+        
+        attachment_edit = QTextEdit()
+        attachment_edit.setReadOnly(True)  # 设置为只读
+        attachment_layout.addWidget(attachment_edit)
+        
+        left_layout.addWidget(attachment_groupbox)
+        
+        # 右侧邮件预览
+        preview_groupbox = QGroupBox("邮件预览")
+        preview_layout = QVBoxLayout(preview_groupbox)
+        
+        email_preview = QTextEdit()
+        email_preview.setReadOnly(True)
+        preview_layout.addWidget(email_preview)
+        
+        right_layout.addWidget(preview_groupbox)
+        
+        # 将左右布局添加到主布局
+        main_layout.addLayout(left_layout, 1)  # 左侧占1份
+        main_layout.addLayout(right_layout, 2)  # 右侧占2份
+
+        # 用于存储原始HTML内容
+        dialog.html_content = ""
+        dialog.email_generated = False
+
+        def check_and_set_attachment_path():
+            """检查并设置附件路径"""
+            attachment_path = app_config.get("attachment_folder_path", "")
+            
+            if not attachment_path or not os.path.exists(attachment_path):
+                QMessageBox.information(dialog, "提示", "未设置附件检测路径，请点击【OK】后选择附件（原图证明文件）所在文件夹。\n若暂未生成过原图证明文件，请先指定一个文件夹用来存放附件（原图证明文件）")
+                # 弹出设置框设置附件路径
+                folder_path = QFileDialog.getExistingDirectory(dialog, "选择附件所在文件夹", "")
+                if folder_path:
+                    app_config["attachment_folder_path"] = folder_path
+                    self.config["attachment_folder_path"] = folder_path
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(app_config, f, ensure_ascii=False, indent=2)
+                    return folder_path
+                else:
+                    return None
+            return attachment_path
+
+        def check_missing_attachments(attachment_path, attachment_keys):
+            """检查缺失的附件"""
+            missing_attachments = []
+            for key in attachment_keys:
+                zip_file_path = os.path.join(attachment_path, f"{key}.zip")
+                if not os.path.exists(zip_file_path):
+                    missing_attachments.append(f"{key}.zip")
+            return missing_attachments
+
+        def show_missing_attachments_dialog(missing_attachments, attachment_keys):
+            """显示缺失附件的自定义对话框"""
+            missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
+            missing_dialog.hide()
+            missing_dialog.setWindowTitle("附件检测结果")
+            missing_dialog.setFixedSize(350, 270)
+            missing_dialog.setWindowModality(Qt.ApplicationModal)
+            
+            layout = QVBoxLayout(missing_dialog)
+            
+            # 标题
+            title_label = QLabel("以下附件不存在，是否生成附件（原图证明文件）？")
+            title_label.setWordWrap(True)
+            layout.addWidget(title_label)
+            
+            # 缺失附件列表
+            list_widget = QTextEdit()
+            list_widget.setReadOnly(True)
+            list_widget.setPlainText("\n".join(missing_attachments))
+            layout.addWidget(list_widget)
+            
+            # 按钮布局
+            button_layout = QHBoxLayout()
+            reselect_btn = QPushButton("重设附件路径")
+            generate_btn = QPushButton("生成")
+            ignore_btn = QPushButton("忽略")
+            
+            button_layout.addWidget(reselect_btn)
+            button_layout.addWidget(generate_btn)
+            button_layout.addWidget(ignore_btn)
+            layout.addLayout(button_layout)
+            
+            def reselect_path():
+                """重设附件路径"""
+                default_path = self.config.get("attachment_folder_path", "")
+                folder_path = QFileDialog.getExistingDirectory(
+                    missing_dialog, 
+                    "选择附件所在文件夹", 
+                    default_path
+                )
+                if folder_path:
+                    app_config["attachment_folder_path"] = folder_path
+                    self.config["attachment_folder_path"] = folder_path
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(app_config, f, ensure_ascii=False, indent=2)
+
+                    # 重新检测
+                    detect_missing(folder_path)
+
+            def detect_missing(folder_path):
+                """统一的缺失附件检测函数"""
+                new_missing = check_missing_attachments(folder_path, attachment_keys)
+                if new_missing:
+                    list_widget.setPlainText("\n".join(new_missing))
+                else:
+                    QMessageBox.information(missing_dialog, "提示", "所有附件都已存在！")
+                    missing_dialog.accept()
+                    
+            def generate_attachments():
+                """生成附件"""
+                missing_dialog.accept()
+                selected_data = []
+                for key in attachment_keys:
+                    if f"{key}.zip" in missing_attachments:
+                        for original_key, _ in self.stolen_img_link_data.items():
+                            if original_key == key:
+                                folder_path = self.get_folder_path_by_key(key)
+                                if folder_path:
+                                    selected_data.append({"path": folder_path})
+                                break
+
+                if selected_data:
+                    self.generate_original_proof(selected_data)
+                    # 重新检测
+                    detect_missing(folder_path)
+            
+            def ignore_missing():
+                """忽略缺失的附件"""
+                missing_dialog.reject()
+            
+            reselect_btn.clicked.connect(reselect_path)
+            generate_btn.clicked.connect(generate_attachments)
+            ignore_btn.clicked.connect(ignore_missing)
+            
+            return missing_dialog.exec_()
+
+        def check_attachments_after_copy():
+            """复制成功后检测附件"""
+            # 获取当前的附件keys
+            attachment_keys = [key for key, links in self.stolen_img_link_data.items() if links]
+            
+            if not attachment_keys:
+                return
+            
+            # 检查并设置附件路径
+            attachment_path = check_and_set_attachment_path()
+            if not attachment_path:
+                return
+            
+            # 检查缺失的附件
+            missing_attachments = check_missing_attachments(attachment_path, attachment_keys)
+            
+            if missing_attachments:
+                show_missing_attachments_dialog(missing_attachments, attachment_keys)
+
+        def build_email():
+            # 校验必填信息
+            if company_radio.isChecked() and not company_edit.text().strip():
+                QMessageBox.warning(dialog, "提示", "请填写公司名称")
+                return
+            if not contact_edit.text().strip():
+                QMessageBox.warning(dialog, "提示", "请填写联系人")
+                return
+            if not phone_edit.text().strip():
+                QMessageBox.warning(dialog, "提示", "请填写电话")
+                return
+            if not email_edit_input.text().strip():
+                QMessageBox.warning(dialog, "提示", "请填写邮箱")
+                return
+
+            main_body = "本人" if person_radio.isChecked() else "本公司"
+            company_name = company_edit.text() if company_radio.isChecked() else ""
+            contact = contact_edit.text()
+            phone = phone_edit.text()
+            email_addr = email_edit_input.text()
+            signature_name = contact if person_radio.isChecked() else company_name
+
+            # 保存输入到配置，包括选项类型
+            reporter_type = "person" if person_radio.isChecked() else "company"
+            app_config.update({
+                "reporter_type": reporter_type,
+                "company_name": company_edit.text(),
+                "contact_name": contact_edit.text(),
+                "phone": phone_edit.text(),
+                "email": email_addr
+            })
+            
+            # 同时更新主配置对象，避免程序关闭时被覆盖
+            self.config.update({
+                "reporter_type": reporter_type,
+                "company_name": company_edit.text(),
+                "contact_name": contact_edit.text(),
+                "phone": phone_edit.text(),
+                "email": email_addr
+            })
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(app_config, f, ensure_ascii=False, indent=2)
+
+            # 构造侵权链接 HTML
+            links_html = ""
+            for key, urls in self.stolen_img_link_data.items():
+                for item in urls:
+                    url = item.get("link", "")
+                    goods_id = item.get("goods_id", "")
+                    goods_id_html = f'<div>商品id: {goods_id}</div>' if goods_id else ""
+                    links_html += f'''
+                    <div class="links" style="
+                        background-color: rgb(249, 249, 249); 
+                        padding: 12px; 
+                        border-left: 4px solid rgb(254, 172, 28); 
+                        margin: 12px 0px; 
+                        word-break: break-all; 
+                        font-family: &quot;Microsoft YaHei&quot;, sans-serif; 
+                        font-size: 14px; 
+                        border-radius: 3px;
+                    ">
+                        <div style="margin-bottom: 4px;">
+                            <a href="{url}" style="color: #0066cc; text-decoration: underline;">{url}</a>
+                        </div>
+                        {goods_id_html}
+                        <div>证明材料附件名称: {key}</div>
+                    </div>
+                    '''
+
+            # 根据选择的类型决定是否显示公司名称
+            company_info_html = ""
+            if company_radio.isChecked():
+                company_info_html = f"公司名称：{company_name}<br>"
+
+            # 原始 HTML 模板 - 使用动态称谓
+            html_content = f"""<div style="clear: both;"></div><meta charset="UTF-8"><div style="clear: both;">
+                    </div><title>产品图片侵权通知</title><div style="clear: both;">
+                    </div><div class="email-container" style="max-width: 600px; margin: 0px auto; background-color: #fff; overflow: hidden; padding: 0px; font-family: 'Microsoft YaHei', sans-serif;">
+                    <div class="content" style="padding: 0px 0px 20px;">
+
+                        <p style="margin: 20px 0px 12px; line-height: 22.4px; font-size: 14px;">尊敬的 Temu 知识产权保护单位：</p>
+
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}发现以下商品未经授权使用了{main_body}拍摄的产品图片，特此通知并请求贵单位依据相关法律法规对涉案侵权商品在<strong>所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理</strong>。</p>
+
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;">{main_body}的产品摄影图原图及相关证明材料见附件。</p>
+
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>侵权产品：</strong></p>
+                        {links_html}
+
+                        <p style="margin: 12px 0px; line-height: 22.4px; font-size: 14px;"><strong>声明：</strong></p>
+                        <ul style="padding-left: 20px; margin: 10px 0px;">
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}是上述产品图片的版权所有者。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">经核实，涉案商品在多个站点均由同一销售主体或关联账户运营，并且商品信息、图片完全一致，构成全平台范围的系统性侵权。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">{main_body}真诚地相信，上述商品中出现的侵权图片的使用行为，未经版权所有者、其代理人或法律授权。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">本通知中的信息真实准确。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">在作伪证将承担法律责任的前提下，{main_body}声明{main_body}是版权所有者。</li>
+                        </ul>
+
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>{main_body}要求：</strong></p>
+                        <ul style="padding-left: 20px; margin: 10px 0px;">
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">Temu 平台应立即对涉案侵权商品在所有国家和地区站点（包括但不限于美国、欧洲、东南亚等）进行下架处理，而非仅限单一站点。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">对相关卖家进行处罚，并建立拦截机制，防止该商品在其他站点再次上架。</li>
+                            <li style="margin: 6px 0px; font-size: 14px; line-height: 22.4px;">若 Temu 仅对部分站点处理，而继续允许其他站点销售侵权商品，则属于明知侵权仍纵容传播，{main_body}将保留进一步追究 Temu 平台连带责任的权利，包括但不限于向国家知识产权局、工商管理部门以及境外监管机构投诉，直至提起诉讼。</li>
+                        </ul>
+
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;"><strong>权利人信息：</strong></p>
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">
+                            {company_info_html}联系人：{contact}<br>
+                            电话：{phone}<br>
+                            邮箱：<a href="mailto:{email_addr}" style="color: #FEAC1C; text-decoration: none;">{email_addr}</a>
+                        </p>
+
+                        <div class="signature" style="margin-top: 20px;">
+                            <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">签名：{signature_name}</p>
+                        </div>
+
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">感谢贵单位的支持和协助！</p>
+
+                        <p style="margin: 12px 0px; font-size: 14px; line-height: 22.4px;">此致<br>敬礼</p>
+
+                    </div>
+                    </div>"""
+
+            # 保存原始HTML内容用于复制
+            dialog.html_content = html_content
+            dialog.email_generated = True
+
+            #生成附件压缩包名称
+            attachments = ' '.join(
+                f'"{key}.zip"' 
+                for key, links in self.stolen_img_link_data.items() 
+                if links  # 只保留非空列表
+            )
+
+            # 显示在附件列表中
+            attachment_edit.setText(attachments)
+            
+            # 在预览面板显示渲染的HTML
+            email_preview.setHtml(html_content)
+
+        def copy_email():
+            if not dialog.html_content:
+                QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
+                return
+
+            clipboard = QApplication.clipboard()
+            clipboard.setText(dialog.html_content)
+            
+            # 检查配置文件里是否已经设置过
+            no_prompt = app_config.get("no_email_copy_prompt", False)
+
+            if no_prompt:
+                # 在主窗口中心显示放大的提示
+                show_large_tooltip(dialog, "✓\n已复制")
+            else:
+                # 显示带勾选框的消息框
+                msg_box = QMessageBox(dialog)
+                msg_box.setWindowTitle("提示")
+                msg_box.setText("举报邮件HTML代码已复制到剪贴板，请切换邮箱编辑界面为【源码】模式粘贴")
+                msg_box.setIcon(QMessageBox.Information)
+                
+                # 添加不再提示勾选框
+                no_prompt_cb = QCheckBox("不再提示")
+                msg_box.setCheckBox(no_prompt_cb)
+                
+                # 显示消息框
+                msg_box.exec_()
+                
+                # 如果勾选了不再提示，保存到配置文件
+                if no_prompt_cb.isChecked():
+                    self.no_email_copy_prompt = True
+                    app_config["no_email_copy_prompt"] = True
+                    self.config["no_email_copy_prompt"] = True
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(app_config, f, ensure_ascii=False, indent=2)
+
+                    # 在主窗口中心显示放大的提示
+                    show_large_tooltip(dialog, "✓\n已复制")
+
+        def copy_name():
+            clipboard = QApplication.clipboard()
+            attachments = ' '.join(
+                f'"{key}.zip"' 
+                for key, links in self.stolen_img_link_data.items() 
+                if links  # 只保留非空列表
+            )
+            clipboard.setText(attachments)
+            show_small_tooltip(attachment_edit, "✓\n已复制")
+            
+            # 复制成功后检测附件
+            QTimer.singleShot(100, check_attachments_after_copy)  # 延迟100ms执行，确保提示先显示
+
+        def show_small_tooltip(parent, text):
+            """在控件中心显示小提示"""
+            tooltip = QLabel(parent)
+            tooltip.setAlignment(Qt.AlignCenter)
+            tooltip.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(200, 200, 200, 150);
+                    border-radius: 10px;
+                    padding: 10px;
+                    font: bold 12px;
+                    min-width: 50px;
+                    min-height: 50px;
+                }
+            """)
+            tooltip.setText(text)
+            tooltip.adjustSize()
+            
+            # 居中显示
+            x = (parent.width() - tooltip.width()) // 2
+            y = (parent.height() - tooltip.height()) // 2
+            tooltip.move(x, y)
+            tooltip.show()
+            
+            # 2秒后自动消失
+            QTimer.singleShot(2000, tooltip.deleteLater)
+
+        def show_large_tooltip(parent, text):
+            """在主窗口中心显示大提示"""
+            tooltip = QLabel(parent)
+            tooltip.setAlignment(Qt.AlignCenter)
+            tooltip.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(200, 200, 200, 200);
+                    border-radius: 15px;
+                    padding: 20px;
+                    font: bold 20px;
+                    min-width: 100px;
+                    min-height: 100px;
+                }
+            """)
+            tooltip.setText(text)
+            tooltip.adjustSize()
+            
+            # 居中显示
+            x = (parent.width() - tooltip.width()) // 2
+            y = (parent.height() - tooltip.height()) // 2
+            tooltip.move(x, y)
+            tooltip.show()
+            
+            # 2秒后自动消失
+            QTimer.singleShot(2000, tooltip.deleteLater)
+
+        generate_btn.clicked.connect(build_email)
+        copy_btn.clicked.connect(copy_email)
+        
+        # 设置附件名称框的点击事件
+        def on_attachment_edit_click(event):
+            if dialog.email_generated:
+                copy_name()
+            else:
+                QMessageBox.warning(dialog, "提示", "请先点击【生成举报邮件】来生成邮件")
+            event.accept()
+        
+        attachment_edit.mousePressEvent = on_attachment_edit_click
+        
+        # 检查是否所有信息都已从配置文件加载成功，如果是则自动生成邮件
+        auto_generate = all([
+            app_config.get("company_name") or app_config.get("reporter_type") == "person",
+            app_config.get("contact_name"),
+            app_config.get("phone"),
+            app_config.get("email")
+        ])
+        
+        if auto_generate:
+            build_email()
+
+        # 给子窗口安装 closeEvent
+        def on_close(event):
+            self.stolen_img_link_data = {}
+            event.accept()
+
+        dialog.closeEvent = on_close  # 覆盖 closeEvent
+
+        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
 
     # 需要添加的辅助方法
     def get_folder_path_by_key(self, key):
@@ -4397,11 +4444,12 @@ class FolderDatabaseApp(QMainWindow):
     #添加绑定盗图侵权链接
     def add_bind_link(self, folder_data):
         name = folder_data.get("name", "未知文件夹")
-        # 初始化字典
         if not hasattr(self, "stolen_img_link_data"):
             self.stolen_img_link_data = {}
         if name not in self.stolen_img_link_data:
             self.stolen_img_link_data[name] = []
+
+        self._goods_id_threads = []  # 保存线程引用
 
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.hide()
@@ -4409,7 +4457,7 @@ class FolderDatabaseApp(QMainWindow):
         dialog.setFixedWidth(500)
         main_layout = QVBoxLayout(dialog)
 
-        # 顶部标题 + 总计放在右上角
+        # 顶部标题 + 总计
         top_layout = QHBoxLayout()
         title_label = QLabel("已绑定的链接：")
         title_label.setStyleSheet("font-weight:bold;")
@@ -4420,44 +4468,15 @@ class FolderDatabaseApp(QMainWindow):
         top_layout.addWidget(total_label)
         main_layout.addLayout(top_layout)
 
-        # 滚动区域显示链接
+        # 滚动区域
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("""
-            QScrollArea {
-                border: 2px solid #e9ecef;
-                border-radius: 6px;
-                background-color: transparent;
-            }
-            QScrollBar:vertical {
-                width: 10px;
-                background: #f8f9fa;
-                margin: 0px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical {
-                background: #ced4da;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #007bff;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
-            }
-        """)
-
+        scroll_area.setFixedHeight(30 * 5)
         scroll_widget = QWidget()
-        scroll_widget.setStyleSheet("""
-            background-color: white;
-            border-radius: 6px;
-            padding: 5px;
-        """)
         scroll_layout = QVBoxLayout(scroll_widget)
         scroll_layout.setContentsMargins(5, 5, 5, 5)
         scroll_layout.setSpacing(5)
         scroll_area.setWidget(scroll_widget)
-        scroll_area.setFixedHeight(30 * 5)  # 高度约显示5条
         main_layout.addWidget(scroll_area)
 
         # 输入框 + 粘贴 + 添加
@@ -4471,42 +4490,30 @@ class FolderDatabaseApp(QMainWindow):
         input_layout.addWidget(add_btn)
         main_layout.addLayout(input_layout)
 
-        # 自动添加选项 - 使用自定义滑动开关
+        # 自动添加开关
         auto_add_layout = QHBoxLayout()
-        auto_add_layout.setContentsMargins(3, 5, 0, 5)        
         auto_add_switch = ToggleSwitch()
-        
         auto_add_label = QLabel("复制链接后自动添加")
         auto_add_label.setStyleSheet("color: #495057; font-size: 12px;")
-        
-        # 从配置文件读取自动添加状态
         auto_add_enabled = self.config.get("auto_add_clipboard_links", False)
         auto_add_switch.setChecked(auto_add_enabled)
-        
-        auto_add_layout.addWidget(auto_add_switch)  
+        auto_add_layout.addWidget(auto_add_switch)
         auto_add_layout.addWidget(auto_add_label)
         auto_add_layout.addStretch()
         main_layout.addLayout(auto_add_layout)
 
-        # 剪切板监控相关变量 - 使用信号机制实现即时响应
         clipboard = QApplication.clipboard()
-        # 关键修改：初始化为空字符串，不读取当前剪贴板内容
-        # 这样即使第一次复制的内容和打开对话框前的内容相同，也能正常添加
         last_clipboard_text = ""
-        
-        # 如果配置中启用了自动添加，准备监控
         monitoring_enabled = auto_add_enabled
 
         # 刷新显示
         def refresh_links():
-            # 清空原有布局
             for i in reversed(range(scroll_layout.count())):
                 item = scroll_layout.itemAt(i).widget()
                 if item:
                     item.setParent(None)
-
-            # 重新添加每条链接和删除按钮
-            for link in self.stolen_img_link_data[name]:
+            for item in self.stolen_img_link_data[name]:
+                link = item.get("link", "")
                 item_widget = QWidget()
                 item_layout = QHBoxLayout(item_widget)
                 item_layout.setContentsMargins(0, 0, 0, 0)
@@ -4515,104 +4522,81 @@ class FolderDatabaseApp(QMainWindow):
                 link_label = QLineEdit(link)
                 link_label.setReadOnly(True)
                 link_label.setStyleSheet("background:transparent; border:none;")
-                link_label.setSizePolicy(link_label.sizePolicy().horizontalPolicy(),
-                                        link_label.sizePolicy().verticalPolicy())
 
                 delete_btn = QPushButton("x")
                 delete_btn.setFixedWidth(30)
                 delete_btn.setStyleSheet("""
-                    QPushButton {
-                        color: #495057;
-                        font-weight: bold;
-                        background-color: transparent;
-                        border: none;
-                    }
-                    QPushButton:hover {
-                        color: white;
-                        background-color: #dc3545;
-                        border-radius: 4px;
-                    }
-                    QPushButton:pressed {
-                        background-color: #bd2130;
-                    }
+                    QPushButton { color: #495057; font-weight: bold; background-color: transparent; border: none; }
+                    QPushButton:hover { color: white; background-color: #dc3545; border-radius: 4px; }
+                    QPushButton:pressed { background-color: #bd2130; }
                 """)
 
-                # 绑定删除事件
-                def make_delete(l=link):
+                def make_delete(target_item=item):
                     def on_delete():
-                        if l in self.stolen_img_link_data[name]:
-                            self.stolen_img_link_data[name].remove(l)
+                        if target_item in self.stolen_img_link_data[name]:
+                            self.stolen_img_link_data[name].remove(target_item)
                             refresh_links()
                     return on_delete
 
                 delete_btn.clicked.connect(make_delete())
-
                 item_layout.addWidget(delete_btn)
                 item_layout.addWidget(link_label)
                 scroll_layout.addWidget(item_widget)
 
             total_label.setText(f"总计：{len(self.stolen_img_link_data[name])}")
 
-        refresh_links()  # 初始化显示
+        refresh_links()
 
-        # 添加链接的通用函数
+        # 添加链接（先添加 link，goods_id 后补）
         def add_link_to_list(link):
-            if link and link not in self.stolen_img_link_data[name]:
-                # 简单的链接格式验证
-                if link.startswith(('http://', 'https://', 'www.')):
-                    self.stolen_img_link_data[name].append(link)
-                    refresh_links()
-                    return True
-            return False
+            if not link.startswith(('http://', 'https://', 'www.')):
+                QMessageBox.warning(self, "错误", "请输入有效的链接")
+                return False
 
-        # 添加链接按钮逻辑
-        def on_add():
-            link = link_edit.text().strip()
-            if add_link_to_list(link):
-                link_edit.clear()
-            else:
-                QMessageBox.information(dialog, "提示", "该链接已存在或格式不正确，请检查后重试。")
+            self.stolen_img_link_data[name].append({"link": link, "goods_id": None})
+            refresh_links()
 
-        add_btn.clicked.connect(on_add)
+            # 启动线程获取 goods_id
+            thread = GoodsIdThread(link)
+            thread.result_signal.connect(on_goods_id_received)
+            thread.finished.connect(lambda t=thread: self._goods_id_threads.remove(t) if t in self._goods_id_threads else None)
+            self._goods_id_threads.append(thread)
+            thread.start()
+            return True
 
-        # 粘贴按钮逻辑
-        def on_paste():
-            clip_text = clipboard.text().strip()
-            if clip_text:
-                link_edit.setText(clip_text)
+        def on_goods_id_received(link, goods_id):
+            try:
+                for item in self.stolen_img_link_data[name]:
+                    if item["link"] == link:
+                        item["goods_id"] = goods_id
+                refresh_links()
+                print(f"[DEBUG] 链接: {link}, goods_id: {goods_id}")
+            except Exception as e:
+                print(f"[DEBUG] 更新 UI 出错: {e}")
 
-        paste_btn.clicked.connect(on_paste)
+        # 添加按钮
+        add_btn.clicked.connect(lambda: add_link_to_list(link_edit.text().strip()) or link_edit.clear())
 
-        # 使用剪贴板的 dataChanged 信号实现即时监测（推荐方案）
+        # 粘贴按钮
+        paste_btn.clicked.connect(lambda: link_edit.setText(clipboard.text().strip()))
+
+        # 剪贴板监控
         def on_clipboard_changed():
             nonlocal last_clipboard_text
             if monitoring_enabled and auto_add_switch.isChecked():
                 current_text = clipboard.text().strip()
-                # 检查是否有新内容且不为空且不同于上次
                 if current_text and current_text != last_clipboard_text:
                     last_clipboard_text = current_text
-                    # 简单验证是否为链接格式
-                    if current_text.startswith(('http://', 'https://', 'www.')):
-                        if add_link_to_list(current_text):
-                            # 显示提示信息
-                            preview = current_text[:30] + '...' if len(current_text) > 30 else current_text
-                            auto_add_label.setText(f"✓ 已自动添加: {preview}")
-                            QTimer.singleShot(3000, lambda: auto_add_label.setText("复制链接后自动添加"))
-
-        # 连接剪贴板变化信号 - 这是最快的监测方式
+                    add_link_to_list(current_text)
         clipboard.dataChanged.connect(on_clipboard_changed)
 
-        # 开关状态改变事件
+        # 自动添加开关切换
         def on_auto_add_changed(state):
             nonlocal last_clipboard_text, monitoring_enabled
-            # 保存状态到配置文件
             self.config["auto_add_clipboard_links"] = state
             self.save_config()
-            
             monitoring_enabled = state
             if state:
-                # 关键修改：启用时不读取当前剪贴板，保持空字符串
-                # 这样用户下一次复制时必然会触发添加
                 last_clipboard_text = ""
                 auto_add_label.setText("复制链接后自动添加 (已启用)")
                 QTimer.singleShot(2000, lambda: auto_add_label.setText("复制链接后自动添加"))
@@ -4621,16 +4605,40 @@ class FolderDatabaseApp(QMainWindow):
 
         auto_add_switch.toggled.connect(on_auto_add_changed)
 
-        # 对话框关闭时断开信号连接
+        # 对话框关闭去重
         def on_dialog_finished():
             try:
                 clipboard.dataChanged.disconnect(on_clipboard_changed)
             except:
                 pass
 
-        dialog.finished.connect(on_dialog_finished)
+            # 去重（goods_id 和 link）
+            seen_links = set()
+            seen_goods = set()
+            new_list = []
+            skipped_links = []  # 用于存储被跳过的链接
 
-        dialog.exec_()
+            for item in self.stolen_img_link_data[name]:
+                link = item.get("link")
+                goods_id = item.get("goods_id")
+                if link in seen_links or (goods_id and goods_id in seen_goods):
+                    skipped_links.append(link)
+                    continue
+                seen_links.add(link)
+                if goods_id:
+                    seen_goods.add(goods_id)
+                new_list.append(item)
+
+            self.stolen_img_link_data[name] = new_list
+            refresh_links()
+
+            # 提示被跳过的链接和数量
+            if skipped_links:
+                msg = f"共去除 {len(skipped_links)} 个重复链接:\n" + "\n".join(skipped_links)
+                QMessageBox.information(dialog, "去重提示", msg)
+
+        dialog.finished.connect(on_dialog_finished)
+        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
 
     # 复制路径       
     def copy_path(self, folder_data):
@@ -5461,7 +5469,7 @@ class FolderDatabaseApp(QMainWindow):
     def check_update(self):
         """显示更新对话框"""
         dialog = UpdateDialog(self, CURRENT_VERSION)
-        dialog.exec_()
+        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
 
     #---------------以下是同步功能逻辑-------------------------------
     def on_json_updated(self, folder_data, remark):
