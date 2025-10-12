@@ -28,9 +28,102 @@ import re
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.0.9" #版本号
+CURRENT_VERSION = "v1.1.0" #版本号
 
 
+#---------------修复dialog窗口在屏幕左上角闪现---------------------------------------
+class FixedPositionDialog(QDialog):
+    def __init__(self, parent=None, offset=QPoint(0, 0)):
+        super().__init__(parent=parent)
+        self.offset = offset
+        self.main_window = parent
+        
+        # 初始无边框 + 透明
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setWindowOpacity(0)
+        self.setAutoFillBackground(True)
+        
+        if sys.platform == 'win32':
+            self.normal_flags = Qt.Dialog | Qt.MSWindowsFixedSizeDialogHint
+        else:
+            self.normal_flags = Qt.Dialog
+        
+        self.setModal(True)
+        self._prepared = False
+        self._result = QDialog.Rejected
+        
+        # 动画对象
+        self.fade_animation = None
+    
+    def exec_(self):
+        if not self._prepared:
+            self.show()
+            self.ensurePolished()
+            self.adjustSize()
+            QApplication.processEvents()
+            
+            # 计算位置
+            if self.main_window and self.main_window.isVisible():
+                pc = self.main_window.frameGeometry().center()
+                x = pc.x() - self.width() // 2 + self.offset.x()
+                y = pc.y() - self.height() // 2 + self.offset.y()
+            else:
+                screen = QApplication.primaryScreen().availableGeometry()
+                x = (screen.width() - self.width()) // 2 + self.offset.x()
+                y = (screen.height() - self.height()) // 2 + self.offset.y()
+            
+            self.move(x, y)
+            QApplication.processEvents()
+            
+            # 切换到正常边框
+            self.hide()
+            self.setWindowFlags(self.normal_flags)
+            
+            self._prepared = True
+        
+        # 显示并淡入
+        super().show()
+        self.fadeIn()
+        
+        return super().exec_()
+    
+    def fadeIn(self, duration=200):
+        """淡入动画"""
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_animation.setDuration(duration)
+        self.fade_animation.setStartValue(0)
+        self.fade_animation.setEndValue(1)
+        self.fade_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.fade_animation.start()
+    
+    def fadeOut(self, duration=200):
+        """淡出动画"""
+        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_animation.setDuration(duration)
+        self.fade_animation.setStartValue(1)
+        self.fade_animation.setEndValue(0)
+        self.fade_animation.setEasingCurve(QEasingCurve.InCubic)
+        self.fade_animation.finished.connect(self._onFadeOutFinished)
+        self.fade_animation.start()
+    
+    def _onFadeOutFinished(self):
+        """淡出完成后真正关闭对话框"""
+        super().done(self._result)
+    
+    def accept(self):
+        """接受时淡出"""
+        self._result = QDialog.Accepted
+        self.fadeOut()
+    
+    def reject(self):
+        """拒绝时淡出"""
+        self._result = QDialog.Rejected
+        self.fadeOut()
+    
+    def done(self, result):
+        """重写 done 方法"""
+        self._result = result
+        self.fadeOut()
 
 #---------------子线程 同步功能---------------------------------------
 class SyncSignals(QObject):
@@ -355,9 +448,7 @@ class CheckUpdateThread(QThread):
             self.update_checked.emit({}, str(e))
 
 # 检测更新窗口
-class UpdateDialog(QDialog):
-    """更新检查对话框 - 使用透明度技术防止左上角闪现"""
-    
+class UpdateDialog(FixedPositionDialog):
     def __init__(self, parent=None, current_version="", offset=QPoint(0, 0)):
         super().__init__(parent=parent)
         self.current_version = current_version
@@ -368,68 +459,18 @@ class UpdateDialog(QDialog):
         self._position_set = False
         self._first_show = True
         
-        #初始时设置窗口为不可见，并移到屏幕外
-        self.setWindowOpacity(0)  # 设置完全透明
-        self.move(-10000, -10000)  # 移到屏幕外
-        
         # 先设置UI（这样可以获取到正确的窗口大小）
         self.setup_ui()
-        
-        # 在显示前设置位置
-        self.set_initial_position()
-        
-        # 现在可以安全地显示窗口
-        self.show()
-        
+    
         # 最后开始检查更新
         self.start_check_update()
-    
-    def set_initial_position(self):
-        """在显示前设置初始位置"""
-        if self._position_set:
-            return
-            
-        if self.main_window:
-            # 相对于父窗口居中
-            main_geom = self.main_window.frameGeometry()
-            main_center = main_geom.center()
-            dialog_geom = self.frameGeometry()
-            dialog_geom.moveCenter(main_center)
-            self.move(dialog_geom.topLeft() + self.offset)
-        else:
-            # 如果没有父窗口，在屏幕中央显示
-            screen = QApplication.primaryScreen().geometry()
-            self.move(screen.center() - self.rect().center() + self.offset)
-        
-        self._position_set = True
-    
-    def showEvent(self, event):
-        """重写showEvent，在第一次显示时延迟恢复可见性"""
-        super().showEvent(event)
-        
-        if self._first_show:
-            self._first_show = False
-            # 确保位置已设置
-            if not self._position_set:
-                self.set_initial_position()
-            
-            # 延迟一帧后恢复可见性
-            QTimer.singleShot(1, self._make_visible)
-    
-    def _make_visible(self):
-        """使窗口可见"""
-        # 再次确认位置
-        if not self._position_set:
-            self.set_initial_position()
-        
-        # 恢复透明度，让窗口可见
-        self.setWindowOpacity(1.0)
         
     def setup_ui(self):
         self.setWindowTitle("检查更新")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.resize(400, 150)
-        
+        self.setMinimumWidth(400)
+        self.setMinimumHeight(150)
+    
         layout = QVBoxLayout()    
         
         # 状态信息
@@ -1745,75 +1786,8 @@ class ZoomableLabel(QLabel):
         
         self.setPixmap(pixmap_with_offset)
 
-class FixedPositionDialog(QDialog):
-    """
-    解决QDialog在左上角闪现问题的基类
-    所有需要避免闪现的Dialog都可以继承此类
-    """
-    def __init__(self, parent=None, offset=QPoint(0, 0)):
-        super().__init__(parent=parent)
-        self.offset = offset
-        self.main_window = parent
-        self._position_set = False
-        self._first_show = True
-        
-        # 关键：初始时设置窗口为不可见，并移到屏幕外
-        self.setWindowOpacity(0)  # 设置完全透明
-        self.move(-10000, -10000)  # 移到屏幕外
-        
-    def set_initial_position(self):
-        """在显示前设置初始位置"""
-        if self._position_set:
-            return
-            
-        if self.main_window:
-            main_geom = self.main_window.frameGeometry()
-            main_center = main_geom.center()
-            dialog_geom = self.frameGeometry()
-            dialog_geom.moveCenter(main_center)
-            self.move(dialog_geom.topLeft() + self.offset)
-        else:
-            # 如果没有父窗口，居中显示在屏幕上
-            screen = QApplication.primaryScreen().geometry()
-            self.move(screen.center() - self.rect().center() + self.offset)
-        
-        self._position_set = True
-    
-    def showEvent(self, event):
-        """重写showEvent，在显示前确保位置已设置"""
-        super().showEvent(event)
-        
-        if self._first_show:
-            self._first_show = False
-            # 确保位置已设置
-            if not self._position_set:
-                self.set_initial_position()
-            
-            # 延迟一帧后恢复可见性和透明度
-            QTimer.singleShot(1, self._make_visible)
-    
-    def _make_visible(self):
-        """使窗口可见"""
-        # 再次确认位置
-        if not self._position_set:
-            self.set_initial_position()
-        
-        # 恢复透明度，让窗口可见
-        self.setWindowOpacity(1.0)
-        
-    def exec_(self):
-        """重写exec_方法，显示前设置位置"""
-        self.set_initial_position()
-        return super().exec_()
-    
-    def show(self):
-        """重写show方法，显示前设置位置"""
-        self.set_initial_position()
-        super().show()
-
-
-class PreviewDialog(QDialog):
-    def __init__(self, image_path, main_window=None, offset=QPoint(50, 50)):
+class PreviewDialog(FixedPositionDialog):
+    def __init__(self, image_path, main_window=None, offset=QPoint(30, 30)):
         # 先不调用父类，因为需要先计算窗口大小
         QDialog.__init__(self, parent=None)  # 暂时使用QDialog的初始化
         
@@ -1822,10 +1796,6 @@ class PreviewDialog(QDialog):
         self.main_window = main_window
         self._position_set = False
         self._first_show = True
-
-        # 防止闪现
-        self.setWindowOpacity(0)
-        self.move(-10000, -10000)
         
         # 根据图片大小调整窗口大小
         pixmap = QPixmap(image_path)
@@ -1890,23 +1860,6 @@ class PreviewDialog(QDialog):
             self.move(screen.center() - self.rect().center() + self.offset)
         
         self._position_set = True
-
-    def showEvent(self, event):
-        """重写showEvent"""
-        super().showEvent(event)
-        
-        if self._first_show:
-            self._first_show = False
-            if not self._position_set:
-                self.set_initial_position()
-            QTimer.singleShot(1, self._make_visible)
-
-    def _make_visible(self):
-        """使窗口可见"""
-        if not self._position_set:
-            self.set_initial_position()
-        self.setWindowOpacity(1.0)
-        self.update_title(self.label.current_image_path)
     
     def update_title(self, image_path):
         """更新窗口标题显示当前图片名"""
@@ -2901,6 +2854,7 @@ class FolderDatabaseApp(QMainWindow):
 
             QScrollArea QWidget {  /* 设置内部 widget 背景 */
                 background-color: white;
+                border-radius: 6px;
                 padding: 8px 12px;
             }
 
@@ -2908,24 +2862,31 @@ class FolderDatabaseApp(QMainWindow):
                 border-color: #007bff;
             }
 
+            /* 滚动条样式 */
             QScrollBar:vertical {
-                width: 10px;
-                background: #f8f9fa;
-                margin: 0px 0px 0px 0px;
-                border-radius: 5px;
+                border: none;
+                background-color: #f8f9fa;
+                width: 12px;
+                border-radius: 6px;
             }
-
+            
             QScrollBar::handle:vertical {
-                background: #ced4da;
-                border-radius: 5px;
+                background-color: #ced4da;
+                border-radius: 6px;
+                min-height: 20px;
             }
-
+            
             QScrollBar::handle:vertical:hover {
-                background: #007bff;
+                background-color: #adb5bd;
             }
-
+            
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0;
+                border: none;
+                background: none;
+            }
+            
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
             }
             
             /* 标签样式 */
@@ -3005,33 +2966,6 @@ class FolderDatabaseApp(QMainWindow):
                 padding: 6px 12px;
                 color: #495057;
                 font-size: 12px;
-            }
-            
-            /* 滚动条样式 */
-            QScrollBar:vertical {
-                border: none;
-                background-color: #f8f9fa;
-                width: 12px;
-                border-radius: 6px;
-            }
-            
-            QScrollBar::handle:vertical {
-                background-color: #ced4da;
-                border-radius: 6px;
-                min-height: 20px;
-            }
-            
-            QScrollBar::handle:vertical:hover {
-                background-color: #adb5bd;
-            }
-            
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                border: none;
-                background: none;
-            }
-            
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
             }
 
             /* 进度条样式 */
@@ -3500,7 +3434,6 @@ class FolderDatabaseApp(QMainWindow):
         """导入产品信息""" 
         # 创建对话框
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.hide()
         dialog.setWindowTitle("产品信息导入")
         dialog.setFixedSize(300, 100)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3574,7 +3507,7 @@ class FolderDatabaseApp(QMainWindow):
         import_btn.clicked.connect(import_from_template)
         
         # 显示对话框
-        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
+        dialog.exec_()  # 延迟显示
 
     def start_imort(self, file_path):
         """开始导入"""
@@ -3679,7 +3612,6 @@ class FolderDatabaseApp(QMainWindow):
     def show_sort_dialog(self):
         """弹出排序设置对话框并排序虚拟列表"""
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.hide()
         dialog.setWindowTitle("排序设置")
         dialog.setFixedSize(280, 350)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3773,7 +3705,7 @@ class FolderDatabaseApp(QMainWindow):
         cancel_btn.clicked.connect(dialog.reject)
 
         # 显示窗口
-        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
+        dialog.exec_()  # 延迟显示
 
     #统一排序函数
     def sort_folders(self):
@@ -3833,7 +3765,6 @@ class FolderDatabaseApp(QMainWindow):
             app_config = {}
 
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.hide()
         dialog.setWindowTitle("生成举报邮件")
         dialog.setFixedSize(800, 600)
         dialog.setWindowModality(Qt.ApplicationModal)
@@ -3970,7 +3901,6 @@ class FolderDatabaseApp(QMainWindow):
         def show_missing_attachments_dialog(missing_attachments, attachment_keys):
             """显示缺失附件的自定义对话框"""
             missing_dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-            missing_dialog.hide()
             missing_dialog.setWindowTitle("附件检测结果")
             missing_dialog.setFixedSize(350, 270)
             missing_dialog.setWindowModality(Qt.ApplicationModal)
@@ -4348,7 +4278,7 @@ class FolderDatabaseApp(QMainWindow):
 
         dialog.closeEvent = on_close  # 覆盖 closeEvent
 
-        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
+        dialog.exec_()  # 延迟显示
 
     # 需要添加的辅助方法
     def get_folder_path_by_key(self, key):
@@ -4451,8 +4381,7 @@ class FolderDatabaseApp(QMainWindow):
 
         self._goods_id_threads = []  # 保存线程引用
 
-        dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.hide()
+        dialog = FixedPositionDialog(parent=self, offset=QPoint(170, 100))
         dialog.setWindowTitle(f"添加绑定盗图链接 - {name}")
         dialog.setFixedWidth(500)
         main_layout = QVBoxLayout(dialog)
@@ -4638,7 +4567,7 @@ class FolderDatabaseApp(QMainWindow):
                 QMessageBox.information(dialog, "去重提示", msg)
 
         dialog.finished.connect(on_dialog_finished)
-        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
+        dialog.exec_()  # 延迟显示
 
     # 复制路径       
     def copy_path(self, folder_data):
@@ -4661,7 +4590,6 @@ class FolderDatabaseApp(QMainWindow):
         
         # 创建备注编辑对话框
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
-        dialog.hide()
         dialog.setWindowTitle("编辑备注")
         dialog.setFixedSize(400, 300)
         dialog.setWindowModality(Qt.WindowModal)
@@ -5469,7 +5397,7 @@ class FolderDatabaseApp(QMainWindow):
     def check_update(self):
         """显示更新对话框"""
         dialog = UpdateDialog(self, CURRENT_VERSION)
-        QTimer.singleShot(150, dialog.exec_)  # 延迟显示
+        dialog.exec_()  # 延迟显示
 
     #---------------以下是同步功能逻辑-------------------------------
     def on_json_updated(self, folder_data, remark):
