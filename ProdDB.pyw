@@ -25,11 +25,15 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import threading
 import re
+from pathlib import Path
+from collections import OrderedDict
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.1.0" #版本号
+CURRENT_VERSION = "v1.1.1" #版本号
 
+BASE_DIR = Path(os.getenv("LOCALAPPDATA")) / "ProdDB"
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 #---------------修复dialog窗口在屏幕左上角闪现---------------------------------------
 class FixedPositionDialog(QDialog):
@@ -426,6 +430,7 @@ class GoodsIdThread(QThread):
                 m2 = re.search(r'-g-(\d+)\.html', final_url)
                 if m2:
                     goods_id = m2.group(1)
+            print(f"[GoodsIdThread] 提取 goods_id: {goods_id} from {final_url}")
         except Exception as e:
             print(f"[GoodsIdThread] 获取 goods_id 失败: {e}")
         self.result_signal.emit(self.link, goods_id or "")
@@ -503,7 +508,7 @@ class UpdateDialog(FixedPositionDialog):
         self.progress_bar.setFixedHeight(button_height1 // 2)
         button_style = """
         QPushButton {
-            background-color: #ffffff;
+            background-color: #EAEAEA;
             color: #3b3b3b;
             border-radius: 6%; /* 圆角半径使用相对单位，可以根据需要调整 */
             border: 1px solid #f5f5f5;
@@ -518,7 +523,6 @@ class UpdateDialog(FixedPositionDialog):
         QPushButton:disabled {
             background-color: #f0f0f0;  /* 禁用时的背景色（浅灰色） */
             color: #a0a0a0;           /* 禁用时的文字颜色（灰色） */
-            border: 1px solid #d0d0d0; /* 禁用时的边框颜色 */
         }
         """
         self.button_layout = QHBoxLayout()
@@ -562,7 +566,7 @@ class UpdateDialog(FixedPositionDialog):
         self.status_label.setText(f"当前版本: {self.current_version}\n最新版本: {self.latest_version}")
 
         if self.latest_version == self.current_version:
-            self.status_label.setText("已经是最新版本")
+            self.status_label.setText(f"已经是最新版本（{self.latest_version}）")
             self.cancel_button.setText("关闭")
             return
 
@@ -1382,7 +1386,7 @@ class ZipGeneratorThread(QThread):
 
 #--------------子线程 扫描文件夹-----------------------
 class FolderScanner(QThread):
-    folder_found = pyqtSignal(str, str, str, str, str, str, str) 
+    folder_found = pyqtSignal(str, str, str, str, str, str, str, str)
     scan_finished = pyqtSignal(int, int)
     update_status = pyqtSignal(str)
 
@@ -1426,13 +1430,19 @@ class FolderScanner(QThread):
                                 thumbnail_cloud, thumbnail = self._generate_thumbnail(item_path, item)
                                 safe_name = "".join(c for c in item if c not in "\\/:*?\"<>|")
                                 json_file_path = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
+                                goods_id_list = []  # 新增，用于存储扫描到的 goods_id
+                                remark = ""
+
                                 if os.path.exists(json_file_path):
                                     try:
                                         with open(json_file_path, 'r', encoding='utf-8') as f:
                                             data = json.load(f)
                                             remark = data.get("remark", "")
+                                            #扫描 goods_id
+                                            goods_id_list = data.get("goods_id", [])
                                     except Exception:
                                         remark = ""
+                                        goods_id_list = []
 
                             # 计算添加日期和修改日期
                             add_timestamp = os.path.getctime(item_path)
@@ -1441,7 +1451,17 @@ class FolderScanner(QThread):
                             modify_date = datetime.fromtimestamp(modify_timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
                             # 发射信号
-                            self.folder_found.emit(item, item_path, thumbnail, remark, add_date, modify_date, thumbnail_cloud)
+                            self.folder_found.emit(
+                                item,              # 文件夹名
+                                item_path,         # 路径
+                                thumbnail,         # 缩略图路径
+                                remark,            # 备注
+                                json.dumps(goods_id_list, ensure_ascii=False),     # goods_id
+                                add_date,          # 添加日期
+                                modify_date,       # 修改日期
+                                thumbnail_cloud,   # 云端缩略图
+                            )
+
                             self.found_count += 1
 
                         continue
@@ -1457,7 +1477,7 @@ class FolderScanner(QThread):
         os.makedirs(thumbnail_cloud_dir, exist_ok=True)
 
         # 本地程序工作目录下的缩略图目录
-        program_dir = os.getcwd()
+        program_dir = BASE_DIR
         thumbnail_dir = os.path.join(program_dir, "thumbnail")
         os.makedirs(thumbnail_dir, exist_ok=True)
 
@@ -2698,7 +2718,7 @@ class FolderDatabaseApp(QMainWindow):
     def __init__(self):
         super().__init__()
         # 配置文件放在程序所在目录
-        app_dir = os.path.dirname(os.path.abspath(__file__))
+        app_dir = BASE_DIR
         self.database_file = os.path.join(app_dir, "folder_database.json").replace('/', '\\')
         self.config_file = os.path.join(app_dir, "app_config.json").replace('/', '\\')
         
@@ -2763,11 +2783,15 @@ class FolderDatabaseApp(QMainWindow):
                 background-color: #f8f9fa;
             }
             
+            /* 对话框样式 */
+             QDialog {
+                background-color: #f8f9fa;
+            }
+                                    
             /* 按钮样式 */
             QPushButton {
-                background-color: #f5f5f5;
+                background-color: #EAEAEA;
                 color: #495057;
-                border: none;
                 padding: 10px 20px;
                 border-radius: 6px;
                 font-size: 13px;
@@ -2778,10 +2802,12 @@ class FolderDatabaseApp(QMainWindow):
             QPushButton:hover {
                 background-color: #007bff;
                 color: white;
+                border: none;
             }
             
             QPushButton:pressed {
                 background-color: #004085;
+                border: none;
             }
             
             QPushButton:disabled {
@@ -2803,8 +2829,7 @@ class FolderDatabaseApp(QMainWindow):
             QPushButton#selectButton:pressed {
                 background-color: #0d0d0f;
             }
-
-            
+  
             /* 输入框样式 */
             QLineEdit {
                 border: 2px solid #e9ecef;
@@ -3122,7 +3147,7 @@ class FolderDatabaseApp(QMainWindow):
         # 清除内边距
         self.clear_db_button.setStyleSheet("""
             QPushButton#clearButton {
-                background-color: #f0f0f0;
+                background-color: #EAEAEA;
                 border: none;
                 padding: 10px 15px 10px 15px;
                 margin: 0px 0px 0px 0px;
@@ -3177,7 +3202,7 @@ class FolderDatabaseApp(QMainWindow):
         # 按钮样式定义
         self.normal_style = """
             QPushButton#menuButton {
-                background-color: #f0f0f0;
+                background-color: #EAEAEA;
                 border: none;
                 padding: 10px 15px 10px 15px;
                 margin: 0px 0px 0px 0px;
@@ -3348,7 +3373,7 @@ class FolderDatabaseApp(QMainWindow):
         
         # 计算位置：在按钮下方显示
         menu_x = button_pos.x()
-        menu_y = button_pos.y() + button_rect.height() + 2
+        menu_y = button_pos.y() + button_rect.height() + 5
         
         # 显示菜单
         self.menu.popup(QPoint(int(menu_x), int(menu_y)))
@@ -4395,7 +4420,30 @@ class FolderDatabaseApp(QMainWindow):
         total_label = QLabel(f"总计：{len(self.stolen_img_link_data[name])}")
         total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         top_layout.addWidget(total_label)
+        # 设置过滤按钮
+        filter_btn = QPushButton("设置过滤")
+        filter_btn.setFixedHeight(22)
+        filter_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #DADADA; 
+                color: #495057;
+                border: none; 
+                border-radius: 4px;
+                padding: 2px 8px;
+            }
+            QPushButton:hover {
+                background-color: #007bff;
+                color: white;
+            }
+            
+            QPushButton:pressed {
+                background-color: #004085;
+            }
+        """)
+        top_layout.addWidget(filter_btn)
+
         main_layout.addLayout(top_layout)
+
 
         # 滚动区域
         scroll_area = QScrollArea()
@@ -4437,10 +4485,17 @@ class FolderDatabaseApp(QMainWindow):
 
         # 刷新显示
         def refresh_links():
+            # 清空旧内容
             for i in reversed(range(scroll_layout.count())):
-                item = scroll_layout.itemAt(i).widget()
+                item = scroll_layout.itemAt(i)
                 if item:
-                    item.setParent(None)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+                    else:
+                        scroll_layout.removeItem(item)  # 删除 stretch 等非 widget 项
+
+            # 添加所有链接
             for item in self.stolen_img_link_data[name]:
                 link = item.get("link", "")
                 item_widget = QWidget()
@@ -4472,9 +4527,208 @@ class FolderDatabaseApp(QMainWindow):
                 item_layout.addWidget(link_label)
                 scroll_layout.addWidget(item_widget)
 
+            # 添加一个伸缩项，确保内容靠上显示
+            scroll_layout.addStretch()
+
             total_label.setText(f"总计：{len(self.stolen_img_link_data[name])}")
 
         refresh_links()
+
+        def open_filter_dialog():
+            # 记录当前 auto_add 状态
+            was_auto_add_enabled = auto_add_switch.isChecked()
+            if was_auto_add_enabled:
+                auto_add_switch.setChecked(False)  # 临时关闭
+                monitoring_enabled = False  # 停止剪贴板监听
+
+            dialog_filter = FixedPositionDialog(dialog)
+            dialog_filter.setWindowTitle("添加过滤商品ID")
+            dialog_filter.setFixedSize(300, 300)  
+
+            layout = QVBoxLayout(dialog_filter)
+
+            # 顶部标签 + 右侧“从链接中提取”按钮
+            top_layout = QHBoxLayout()
+            label = QLabel("商品ID：")
+            btn_extract_from_link = QPushButton("从链接中提取")
+            btn_extract_from_link.setFixedHeight(22)
+            btn_extract_from_link.setStyleSheet("""
+                QPushButton {
+                    background-color: #DADADA; 
+                    color: #495057;
+                    border: none; 
+                    border-radius: 4px;
+                    padding: 2px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #007bff;
+                    color: white;
+                }
+                
+                QPushButton:pressed {
+                    background-color: #004085;
+                }
+            """)
+            top_layout.addWidget(label)
+            top_layout.addStretch()
+            top_layout.addWidget(btn_extract_from_link)
+            layout.addLayout(top_layout)
+
+            # 中间文本编辑框
+            text_edit = QTextEdit()
+            text_edit.setPlaceholderText("请输入要过滤的商品ID\n例如：\n601099604582409\n601099604576384\n...")
+            text_edit.setToolTip("过滤的商品ID，每行一个\n添加后将跳过这些ID对应的商品")
+            layout.addWidget(text_edit)
+
+            # 预填已有的过滤ID
+            existing_ids = folder_data.get("goods_id", [])
+            if existing_ids:
+                text_edit.setText("\n".join(existing_ids))
+
+            # 底部按钮布局
+            btn_layout = QHBoxLayout()
+            btn_save = QPushButton("保存")
+            btn_cancel = QPushButton("取消")
+            btn_layout.addStretch()  # 左侧空白，按钮靠右
+            btn_layout.addWidget(btn_save)
+            btn_layout.addWidget(btn_cancel)
+            layout.addLayout(btn_layout)
+
+            # --- 保存逻辑 ---
+            def on_save():
+                ids_text = text_edit.toPlainText().strip()
+                ids = [line.strip() for line in ids_text.splitlines() if line.strip()]
+
+                # 如果 folder_data 中有 remark，则在 remark 后插入 goods_id
+                if "remark" in folder_data:
+                    new_data = {}
+                    for key, value in folder_data.items():
+                        new_data[key] = value
+                        if key == "remark":
+                            new_data["goods_id"] = ids
+                    folder_data.clear()
+                    folder_data.update(new_data)
+                else:
+                    folder_data["goods_id"] = ids
+
+                # 写入已修文件夹 JSON
+                fixed_folder = os.path.join(folder_data["path"], "已修")
+                if os.path.exists(fixed_folder):
+                    safe_name = "".join(c for c in folder_data["name"] if c not in "\\/:*?\"<>|")
+                    json_file = os.path.join(fixed_folder, f"{safe_name}_产品信息.json")
+
+                    if os.path.exists(json_file):
+                        try:
+                            with open(json_file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                        except Exception:
+                            data = {}
+                    else:
+                        data = {}
+
+                    data["goods_id"] = folder_data.get("goods_id", [])
+                    try:
+                        with open(json_file, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        print(f"[INFO] 已更新 {json_file} 中的 goods_id")
+                    except Exception as e:
+                        print(f"[ERROR] 保存 {json_file} 失败: {e}")
+
+                self.save_database()
+                dialog_filter.accept()
+
+            btn_save.clicked.connect(on_save)
+            btn_cancel.clicked.connect(dialog_filter.reject)
+
+            # --- 从链接中提取逻辑 ---
+            def on_extract_from_link():
+                extract_dialog = FixedPositionDialog(dialog_filter)
+                extract_dialog.setWindowTitle("从链接中提取商品ID")
+                extract_dialog.setFixedSize(450, 100)
+
+                v_layout = QVBoxLayout(extract_dialog)
+
+                h_layout = QHBoxLayout()
+                link_edit = QLineEdit()
+                link_edit.setPlaceholderText("请粘贴商品链接")
+                btn_paste = QPushButton("粘贴")
+                btn_extract = QPushButton("提取")
+                h_layout.addWidget(link_edit)
+                h_layout.addWidget(btn_paste)
+                h_layout.addWidget(btn_extract)
+                v_layout.addLayout(h_layout)
+
+                def on_paste():
+                    clipboard_text = QApplication.clipboard().text().strip()
+                    link_edit.setText(clipboard_text)
+
+                def on_extract():
+                    link = link_edit.text().strip()
+                    if not link:
+                        QMessageBox.warning(extract_dialog, "错误", "请输入链接")
+                        return
+
+                    # 启动线程获取 goods_id
+                    thread = GoodsIdThread(link)
+
+                    # 提取完成后更新过滤框 text_edit
+                    def on_goods_id_received(link, goods_id):
+                        if not goods_id:
+                            QMessageBox.warning(dialog_filter, "提示", f"未提取到 goods_id: {link}")
+                            return
+
+                        # 确保 goods_id 是列表
+                        if isinstance(goods_id, str):
+                            goods_id = [goods_id]
+                        elif not isinstance(goods_id, (list, tuple)):
+                            goods_id = list(goods_id)
+
+                        # 获取现有的文本内容
+                        existing_ids = set(line.strip() for line in text_edit.toPlainText().splitlines() if line.strip())
+
+                        # 分离重复和新增 ID
+                        new_ids = []
+                        skipped_ids = []
+                        for gid in goods_id:
+                            if gid in existing_ids:
+                                skipped_ids.append(gid)
+                            else:
+                                new_ids.append(gid)
+
+                        # 更新过滤框，只添加新增 ID
+                        if new_ids:
+                            updated_ids = existing_ids.union(new_ids)
+                            text_edit.setText("\n".join(sorted(updated_ids)))
+
+                        # 提示被跳过的重复 ID
+                        if skipped_ids:
+                            QMessageBox.information(dialog_filter, "提示", f"以下 ID 已存在，已跳过:\n" + "\n".join(skipped_ids))
+
+                    thread.result_signal.connect(on_goods_id_received)
+                    thread.finished.connect(lambda t=thread: self._goods_id_threads.remove(t) if t in self._goods_id_threads else None)
+                    self._goods_id_threads.append(thread)
+                    thread.start()
+
+                    extract_dialog.accept()
+
+                btn_paste.clicked.connect(on_paste)
+                btn_extract.clicked.connect(on_extract)
+
+                extract_dialog.exec_()
+
+            btn_extract_from_link.clicked.connect(on_extract_from_link)
+
+            # 当对话框关闭时恢复 auto_add 开关状态
+            def on_dialog_closed():
+                nonlocal monitoring_enabled
+                if was_auto_add_enabled:
+                    auto_add_switch.setChecked(True)
+                    monitoring_enabled = True
+
+            dialog_filter.finished.connect(on_dialog_closed)
+            dialog_filter.exec_()
+
+        filter_btn.clicked.connect(open_filter_dialog)
 
         # 添加链接（先添加 link，goods_id 后补）
         def add_link_to_list(link):
@@ -4541,30 +4795,47 @@ class FolderDatabaseApp(QMainWindow):
             except:
                 pass
 
-            # 去重（goods_id 和 link）
+            # 去重（goods_id 和 link），以及过滤（folder_data['goods_id']）
             seen_links = set()
             seen_goods = set()
             new_list = []
-            skipped_links = []  # 用于存储被跳过的链接
+            skipped_links = []       # 重复链接
+            filtered_links = []      # 被过滤的 goods_id 链接
+
+            # 获取当前文件夹的过滤 goods_id
+            filter_goods_ids = set(folder_data.get("goods_id", []))
 
             for item in self.stolen_img_link_data[name]:
                 link = item.get("link")
                 goods_id = item.get("goods_id")
+
+                # 先去重
                 if link in seen_links or (goods_id and goods_id in seen_goods):
                     skipped_links.append(link)
                     continue
                 seen_links.add(link)
                 if goods_id:
                     seen_goods.add(goods_id)
+
+                # 再过滤
+                if goods_id and any(fgid in str(goods_id) for fgid in filter_goods_ids):
+                    filtered_links.append(link)
+                    continue
+
                 new_list.append(item)
 
             self.stolen_img_link_data[name] = new_list
             refresh_links()
 
-            # 提示被跳过的链接和数量
+            # 构建提示信息
+            msg_parts = []
             if skipped_links:
-                msg = f"共去除 {len(skipped_links)} 个重复链接:\n" + "\n".join(skipped_links)
-                QMessageBox.information(dialog, "去重提示", msg)
+                msg_parts.append(f"共去除 {len(skipped_links)} 个重复链接:\n" + "\n".join(skipped_links))
+            if filtered_links:
+                msg_parts.append(f"共去除 {len(filtered_links)} 个被过滤的链接:\n" + "\n".join(filtered_links))
+
+            if msg_parts:
+                QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
 
         dialog.finished.connect(on_dialog_finished)
         dialog.exec_()  # 延迟显示
@@ -4702,7 +4973,7 @@ class FolderDatabaseApp(QMainWindow):
 
     def _generate_thumbnail_from_image(self, image_path, folder_name):
         """根据用户选择的图片生成 400x400 缩略图 (主线程调用)"""
-        thumbnail_dir = os.path.join(os.getcwd(), "thumbnail")
+        thumbnail_dir = os.path.join(BASE_DIR, "thumbnail")
         os.makedirs(thumbnail_dir, exist_ok=True)
 
         if not os.path.exists(image_path):
@@ -5062,16 +5333,18 @@ class FolderDatabaseApp(QMainWindow):
 
         # 接收字段值
         self.scanner_thread.folder_found.connect(
-            lambda name, path, thumb, remark, add_date, modify_date, thumb_cloud: self.add_folder_realtime({
+            lambda name, path, thumb, remark, goods_id_json, add_date, modify_date, thumb_cloud: self.add_folder_realtime({
                 'name': name,
                 'path': path,
                 'thumbnail': thumb,
                 'thumbnail_cloud': thumb_cloud,
                 'remark': remark,
+                'goods_id': json.loads(goods_id_json),  # JSON 字符串解析回 list
                 'add_date': add_date,
-                'modify_date': modify_date
+                'modify_date': modify_date,
             })
         )
+
         self.scanner_thread.scan_finished.connect(self.scan_completed)
         self.scanner_thread.update_status.connect(self.update_status_label)
 
@@ -5257,7 +5530,7 @@ class FolderDatabaseApp(QMainWindow):
 
         if reply == QMessageBox.Yes:
             # 删除所有缩略图
-            thumbnail_dir = os.path.join(os.getcwd(), "thumbnail")
+            thumbnail_dir = os.path.join(BASE_DIR, "thumbnail")
             if os.path.exists(thumbnail_dir):
                 for file in os.listdir(thumbnail_dir):
                     if file.lower().endswith('.png'):
@@ -5366,11 +5639,29 @@ class FolderDatabaseApp(QMainWindow):
                 if widget:
                     widget.setToolTip(f"{path}\n{remark}" if remark else path)
 
+            # 重新按指定字段顺序构建列表
+            ordered_folders = []
+            for folder_data in self.folders_data:
+                ordered_folder = OrderedDict([
+                    ("name", folder_data.get("name", "")),
+                    ("path", folder_data.get("path", "")),
+                    ("thumbnail", folder_data.get("thumbnail", "")),
+                    ("thumbnail_cloud", folder_data.get("thumbnail_cloud", "")),
+                    ("remark", folder_data.get("remark", "")),
+                    ("goods_id", folder_data.get("goods_id", [])),
+                    ("add_date", folder_data.get("add_date", "")),
+                    ("modify_date", folder_data.get("modify_date", "")),
+                    ("_last_json_mtime", folder_data.get("_last_json_mtime", 0)),
+                    ("_last_thumb_mtime", folder_data.get("_last_thumb_mtime", 0))
+                ])
+                ordered_folders.append(ordered_folder)
+
             # 保存数据库到 JSON 文件
             with open(self.database_file, 'w', encoding='utf-8') as f:
-                json.dump(self.folders_data, f, ensure_ascii=False, indent=2)
+                json.dump(ordered_folders, f, ensure_ascii=False, indent=2)
+
         except Exception as e:
-            QMessageBox.critical(self, "错误", f"保存数据库失败：{str(e)}\n请以管理员身份运行此程序！")
+            QMessageBox.critical(self, "错误", f"保存数据库失败：{str(e)}")
 
     #加载配置文件
     def load_config(self):
@@ -5391,7 +5682,7 @@ class FolderDatabaseApp(QMainWindow):
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"保存配置文件失败：{str(e)}\n请以管理员身份运行此程序！")
+            print(f"保存配置文件失败：{str(e)}")
 
     #检查更新
     def check_update(self):
