@@ -4226,7 +4226,8 @@ class FolderDatabaseApp(QMainWindow):
             tooltip.setAlignment(Qt.AlignCenter)
             tooltip.setStyleSheet("""
                 QLabel {
-                    background-color: rgba(200, 200, 200, 150);
+                    background-color: rgba(0, 0, 0, 0.7);
+                    color: white;
                     border-radius: 10px;
                     padding: 10px;
                     font: bold 12px;
@@ -4252,7 +4253,8 @@ class FolderDatabaseApp(QMainWindow):
             tooltip.setAlignment(Qt.AlignCenter)
             tooltip.setStyleSheet("""
                 QLabel {
-                    background-color: rgba(200, 200, 200, 200);
+                    background-color: rgba(0, 0, 0, 0.7);
+                    color: white;
                     border-radius: 15px;
                     padding: 20px;
                     font: bold 20px;
@@ -4738,11 +4740,13 @@ class FolderDatabaseApp(QMainWindow):
 
             self.stolen_img_link_data[name].append({"link": link, "goods_id": None})
             refresh_links()
-
             # 启动线程获取 goods_id
             thread = GoodsIdThread(link)
-            thread.result_signal.connect(on_goods_id_received)
-            thread.finished.connect(lambda t=thread: self._goods_id_threads.remove(t) if t in self._goods_id_threads else None)
+            thread.result_signal.connect(lambda l, gid: on_goods_id_received(l, gid))
+            thread.finished.connect(lambda t=thread: (
+                self._goods_id_threads.remove(t) if t in self._goods_id_threads else None,
+                check_threads_finished()
+            ))
             self._goods_id_threads.append(thread)
             thread.start()
             return True
@@ -4752,7 +4756,7 @@ class FolderDatabaseApp(QMainWindow):
                 for item in self.stolen_img_link_data[name]:
                     if item["link"] == link:
                         item["goods_id"] = goods_id
-                refresh_links()
+                refresh_links()  # 只更新显示，不删除
                 print(f"[DEBUG] 链接: {link}, goods_id: {goods_id}")
             except Exception as e:
                 print(f"[DEBUG] 更新 UI 出错: {e}")
@@ -4788,57 +4792,188 @@ class FolderDatabaseApp(QMainWindow):
 
         auto_add_switch.toggled.connect(on_auto_add_changed)
 
-        # 对话框关闭去重
-        def on_dialog_finished():
-            try:
-                clipboard.dataChanged.disconnect(on_clipboard_changed)
-            except:
-                pass
+        # 线程完成检查（不做任何UI操作）
+        def check_threads_finished():
+            active_threads = [t for t in self._goods_id_threads if t.isRunning()]
+            if not active_threads:
+                print("[DEBUG] 所有线程已完成")
 
-            # 去重（goods_id 和 link），以及过滤（folder_data['goods_id']）
+        # 初始化待处理列表
+        self._pending_skipped_links = []
+        self._pending_filtered_links = []
+
+        def perform_dedup_filter():
+            """在关闭窗口时执行去重/过滤"""
             seen_links = set()
             seen_goods = set()
-            new_list = []
-            skipped_links = []       # 重复链接
-            filtered_links = []      # 被过滤的 goods_id 链接
 
-            # 获取当前文件夹的过滤 goods_id
-            filter_goods_ids = set(folder_data.get("goods_id", []))
+            filter_goods_ids = set(folder_data.get("goods_id", []) or [])
+            print(f"[DEBUG] 过滤 ID 列表: {filter_goods_ids}")
 
+            pending_skipped = []
+            pending_filtered = []
+            items_to_keep = []
+            
             for item in self.stolen_img_link_data[name]:
                 link = item.get("link")
                 goods_id = item.get("goods_id")
+                print(f"[DEBUG] 检查链接: {link}, goods_id: {goods_id}")
 
-                # 先去重
-                if link in seen_links or (goods_id and goods_id in seen_goods):
-                    skipped_links.append(link)
-                    continue
+                # 去重：只删除重复出现的，保留第一次
+                is_duplicate = link in seen_links or (goods_id and goods_id in seen_goods)
+                
+                if is_duplicate:
+                    pending_skipped.append(link)
+                    continue  # 跳过重复项
+                
+                # 记录已见过的
                 seen_links.add(link)
                 if goods_id:
                     seen_goods.add(goods_id)
 
-                # 再过滤
-                if goods_id and any(fgid in str(goods_id) for fgid in filter_goods_ids):
-                    filtered_links.append(link)
-                    continue
+                # 过滤检查
+                if goods_id and any(str(fgid) in str(goods_id) for fgid in filter_goods_ids):
+                    pending_filtered.append(link)
+                    continue  # 跳过被过滤的项
+                
+                # 保留该项
+                items_to_keep.append(item)
 
-                new_list.append(item)
+            # 更新数据（实际删除）
+            self.stolen_img_link_data[name] = items_to_keep
+            
+            # 保存待提示的信息
+            self._pending_skipped_links = pending_skipped
+            self._pending_filtered_links = pending_filtered
 
-            self.stolen_img_link_data[name] = new_list
+
+        # 创建无按钮的等待提示框
+        waiting_dialog = None
+
+        def show_waiting_dialog():
+            nonlocal waiting_dialog
+            waiting_dialog = QDialog(dialog)
+            waiting_dialog.setModal(True)
+            
+            # 去除标题栏和边框
+            waiting_dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+            waiting_dialog.setAttribute(Qt.WA_TranslucentBackground)
+            
+            # 主容器
+            main_widget = QWidget()
+            main_widget.setObjectName("mainWidget")
+            main_widget.setStyleSheet("""
+                #mainWidget {
+                    background-color: rgba(0, 0, 0, 0.7);
+                    border-radius: 8px;
+                    padding: 0px;
+                }
+            """)
+            
+            layout = QVBoxLayout(waiting_dialog)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(main_widget)
+            
+            # 内容布局
+            content_layout = QVBoxLayout(main_widget)
+            
+            # 提示文字
+            label = QLabel("正在提取商品ID，请稍候...")
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet("""
+                QLabel {
+                    color: white;
+                    font-size: 15px;
+                    font-weight: 500;
+                    background: transparent;
+                    letter-spacing: 0.3px;
+                }
+            """)
+            content_layout.addWidget(label)
+            
+            waiting_dialog.show()
+
+        def close_waiting_dialog_and_finish():
+            nonlocal waiting_dialog
+            if waiting_dialog:
+                waiting_dialog.close()
+                waiting_dialog = None
+            
+            # 执行去重/过滤
+            perform_dedup_filter()
+            
+            # 刷新显示
             refresh_links()
 
-            # 构建提示信息
+            # 弹窗提示去重/过滤结果
             msg_parts = []
-            if skipped_links:
-                msg_parts.append(f"共去除 {len(skipped_links)} 个重复链接:\n" + "\n".join(skipped_links))
-            if filtered_links:
-                msg_parts.append(f"共去除 {len(filtered_links)} 个被过滤的链接:\n" + "\n".join(filtered_links))
-
+            if self._pending_skipped_links:
+                msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
+            if self._pending_filtered_links:
+                msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
             if msg_parts:
                 QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
 
-        dialog.finished.connect(on_dialog_finished)
-        dialog.exec_()  # 延迟显示
+            self._pending_skipped_links = []
+            self._pending_filtered_links = []
+            
+            # 清理剪贴板监听
+            try:
+                clipboard.dataChanged.disconnect(on_clipboard_changed)
+            except Exception:
+                pass
+            
+            # 关闭主对话框
+            dialog.close()
+
+
+        # 关闭对话框事件
+        def dialog_close_event(event):
+            active_threads = [t for t in self._goods_id_threads if t.isRunning()]
+            if active_threads:
+                # 显示无按钮等待框
+                show_waiting_dialog()
+                
+                # 监听所有线程完成
+                def check_threads_finished_for_close():
+                    if all(not t.isRunning() for t in self._goods_id_threads):
+                        timer.stop()
+                        close_waiting_dialog_and_finish()
+                
+                timer = QTimer()
+                timer.timeout.connect(check_threads_finished_for_close)
+                timer.start(100)  # 每100ms检查一次
+                
+                event.ignore()  # 阻止对话框关闭
+                return
+
+            # 没有活动线程，直接执行去重/过滤
+            perform_dedup_filter()
+            refresh_links()
+
+            msg_parts = []
+            if self._pending_skipped_links:
+                msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
+            if self._pending_filtered_links:
+                msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
+            if msg_parts:
+                QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
+
+            # 清理剪贴板监听
+            try:
+                clipboard.dataChanged.disconnect(on_clipboard_changed)
+            except Exception:
+                pass
+
+            self._pending_skipped_links = []
+            self._pending_filtered_links = []
+
+            event.accept()
+
+        # 绑定关闭事件
+        dialog.closeEvent = dialog_close_event
+        dialog.exec_()
+
 
     # 复制路径       
     def copy_path(self, folder_data):
