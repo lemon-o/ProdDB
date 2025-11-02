@@ -5084,42 +5084,115 @@ class FolderDatabaseApp(QMainWindow):
             QApplication.processEvents()  # 确保立即显示
             return waiting_dialog
 
+        # **在外部定义公共的去重/过滤逻辑函数**
+        def perform_finish_and_cleanup():
+            """执行去重/过滤并显示提示"""
+            print("[DEBUG] 开始执行去重/过滤")
+
+            # **确保停止所有定时器**
+            if hasattr(self, '_active_timer') and self._active_timer:
+                self._active_timer.stop()
+                self._active_timer = None
+
+            # **执行去重/过滤逻辑**
+            perform_dedup_filter()
+            refresh_links()
+
+            # **收集去重信息**
+            msg_parts = []
+            if self._pending_skipped_links:
+                msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
+            if self._pending_filtered_links:
+                msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
+
+            # **显示提示框**
+            if msg_parts:
+                msg_text = "\n".join(msg_parts)
+
+                from PyQt5.QtWidgets import QMessageBox
+
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("处理结果")
+                msg_box.setText(msg_text)
+                msg_box.setIcon(QMessageBox.Information)
+
+                ok_button = msg_box.addButton("确定", QMessageBox.AcceptRole)
+
+                msg_box.setStyleSheet("""
+                QMessageBox QPushButton {
+                    background-color: #EAEAEA;
+                    color: #495057;
+                    padding: 8px 20px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    font-weight: 500;
+                }
+                QMessageBox QPushButton:hover {
+                    background-color: #007bff;
+                    color: white;
+                    border: none;
+                }
+                QMessageBox QPushButton:pressed {
+                    background-color: #004085;
+                    border: none;
+                }
+                QMessageBox QPushButton:disabled {
+                    background-color: #6c757d;
+                    color: #adb5bd;
+                }
+                """)
+
+                msg_box.exec_()
+
+            # 清理剪贴板监听
+            try:
+                clipboard.dataChanged.disconnect(on_clipboard_changed)
+            except Exception:
+                pass
+
+            self._pending_skipped_links = []
+            self._pending_filtered_links = []
+
+            # **清理线程列表**
+            self._goods_id_threads = []
+
+            print("[DEBUG] 去重/过滤完成")
+
+
         def close_waiting_dialog_and_finish():
             nonlocal waiting_dialog
             if waiting_dialog:
                 waiting_dialog.close()
                 waiting_dialog = None
             
-            # 执行去重/过滤
-            perform_dedup_filter()
+            # **检查是否有失败的链接**
+            failed_links = [
+                item.get("link")
+                for item in self.stolen_img_link_data[name]
+                if not item.get("goods_id")
+            ]
             
-            # 刷新显示
-            refresh_links()
-
-            # 弹窗提示去重/过滤结果
-            msg_parts = []
-            if self._pending_skipped_links:
-                msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
-            if self._pending_filtered_links:
-                msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
-            if msg_parts:
-                QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
-
-            self._pending_skipped_links = []
-            self._pending_filtered_links = []
+            if failed_links:
+                # **有失败链接，不执行去重，让 dialog_close_event 处理**
+                print(f"[DEBUG] 发现 {len(failed_links)} 个失败链接，等待用户选择")
+                # **触发对话框关闭事件，让其处理失败链接**
+                dialog.close()
+                return
             
-            # 清理剪贴板监听
-            try:
-                clipboard.dataChanged.disconnect(on_clipboard_changed)
-            except Exception:
-                pass
-            
-            # 关闭主对话框
+            # **没有失败链接，调用统一的去重逻辑**
+            print("[DEBUG] 没有失败链接，调用 perform_finish_and_cleanup")
+            self._is_closing = True
+            perform_finish_and_cleanup()
             dialog.close()
+            self._is_closing = False
 
 
-        # 关闭对话框事件
         def dialog_close_event(event):
+            # **添加：防止重复处理关闭事件**
+            if hasattr(self, '_is_closing') and self._is_closing:
+                event.accept()
+                return
+            
             # **添加：停止所有可能存在的旧定时器**
             if hasattr(self, '_active_timer') and self._active_timer:
                 self._active_timer.stop()
@@ -5135,6 +5208,7 @@ class FolderDatabaseApp(QMainWindow):
                         self._active_timer.stop()
                         self._active_timer = None
                         wait_dialog.close()
+                        # **调用后会检查失败链接**
                         close_waiting_dialog_and_finish()
                 
                 self._active_timer = QTimer()
@@ -5142,6 +5216,142 @@ class FolderDatabaseApp(QMainWindow):
                 self._active_timer.start(100)
                 event.ignore()
                 return
+            
+            # **在 dialog_close_event 内部封装调用**
+            def finish_dialog_close():
+                """完成对话框关闭的后续处理"""
+                perform_finish_and_cleanup()
+            
+            # **定义重试逻辑函数**
+            def start_retry(links_to_retry):
+                """启动重试线程"""
+                wait_dialog = show_waiting_dialog(dialog, f"正在重新提取 {len(links_to_retry)} 个失败的商品ID，请稍候...")
+                
+                # **清空旧线程列表**
+                self._goods_id_threads = []
+                
+                # 为每个失败链接创建线程
+                for link in links_to_retry:
+                    retry_thread = GoodsIdThread(link)
+                    
+                    def make_retry_received(link):
+                        def on_retry_received(received_link, goods_id):
+                            print(f"[DEBUG] 重试收到结果: {received_link}, goods_id: {goods_id}")
+                            for item in self.stolen_img_link_data[name]:
+                                if item["link"] == link:
+                                    item["goods_id"] = goods_id
+                                    break
+                            refresh_links()
+                        return on_retry_received
+                    
+                    retry_thread.result_signal.connect(make_retry_received(link))
+                    
+                    # **先从列表移除，再删除对象**
+                    def make_cleanup(thread):
+                        def cleanup():
+                            try:
+                                if thread in self._goods_id_threads:
+                                    self._goods_id_threads.remove(thread)
+                            except (ValueError, RuntimeError):
+                                pass
+                            thread.deleteLater()
+                        return cleanup
+                    
+                    retry_thread.finished.connect(make_cleanup(retry_thread))
+                    self._goods_id_threads.append(retry_thread)
+                    retry_thread.start()
+                
+                # 检查所有重试线程完成
+                def check_retry_threads():
+                    # **安全地检查线程状态**
+                    still_running = []
+                    for t in self._goods_id_threads[:]:
+                        try:
+                            if t.isRunning():
+                                still_running.append(t)
+                        except RuntimeError:
+                            pass
+                    
+                    print(f"[DEBUG] 重试中，剩余运行线程: {len(still_running)}")
+                    
+                    if not still_running:
+                        self._active_timer.stop()
+                        self._active_timer = None
+                        wait_dialog.close()
+                        
+                        # **延迟执行，避免事件循环阻塞**
+                        QTimer.singleShot(100, finish_and_check_again)
+                
+                self._active_timer = QTimer()
+                self._active_timer.timeout.connect(check_retry_threads)
+                self._active_timer.start(100)
+            
+            # **定义重试完成后的检查函数**
+            def finish_and_check_again():
+                """完成重试后再次检查是否还有失败的链接"""
+                still_failed = [
+                    item.get("link")
+                    for item in self.stolen_img_link_data[name]
+                    if not item.get("goods_id")
+                ]
+                
+                if still_failed:
+                    # **不再使用临时事件，直接处理失败链接逻辑**
+                    self._goods_id_threads = []
+                    
+                    # 再次显示提示框
+                    msg_box2 = QMessageBox(dialog)
+                    msg_box2.setWindowTitle("未提取到商品ID")
+                    msg_box2.setIcon(QMessageBox.Warning)
+                    
+                    failed_text2 = f"以下 {len(still_failed)} 个链接仍未成功提取商品ID：\n"
+                    if len(still_failed) <= 5:
+                        failed_text2 += "\n".join(still_failed)
+                    else:
+                        failed_text2 += "\n".join(still_failed[:5]) + f"\n... (还有 {len(still_failed) - 5} 个)"
+                    failed_text2 += "\n\n请选择操作："
+                    
+                    msg_box2.setText(failed_text2)
+                    retry_btn2 = msg_box2.addButton("重试", QMessageBox.AcceptRole)
+                    delete_btn2 = msg_box2.addButton("删除失败链接", QMessageBox.DestructiveRole)
+                    ignore_btn2 = msg_box2.addButton("忽略", QMessageBox.RejectRole)
+                    msg_box2.exec_()
+                    
+                    clicked_button2 = msg_box2.clickedButton()
+                    
+                    if clicked_button2 == retry_btn2:
+                        # **再次重试：直接调用重试函数，而不是递归**
+                        start_retry(still_failed)
+                    elif clicked_button2 == delete_btn2:
+                        # 删除失败链接
+                        print(f"[DEBUG] 删除失败链接: {still_failed}")
+                        self.stolen_img_link_data[name] = [
+                            item for item in self.stolen_img_link_data[name]
+                            if item.get("link") not in still_failed
+                        ]
+                        refresh_links()
+                        QMessageBox.information(
+                            dialog,
+                            "删除完成",
+                            f"已删除 {len(still_failed)} 个未成功提取商品ID的链接"
+                        )
+                        # **设置关闭标志并关闭**
+                        self._is_closing = True
+                        finish_dialog_close()
+                        dialog.close()
+                        self._is_closing = False
+                    else:
+                        # 忽略：直接关闭
+                        self._is_closing = True
+                        finish_dialog_close()
+                        dialog.close()
+                        self._is_closing = False
+                else:
+                    # 全部成功，执行去重/过滤并关闭
+                    self._is_closing = True
+                    finish_dialog_close()
+                    dialog.close()
+                    self._is_closing = False
             
             # ---- 所有线程完成，开始处理失败的 goods_id ----
             failed_links = [
@@ -5151,7 +5361,7 @@ class FolderDatabaseApp(QMainWindow):
             ]
             
             if failed_links:
-                # **合并后的提示框：显示失败链接并询问是否重试**
+                # **合并后的提示框：显示失败链接并提供三个选项**
                 msg_box = QMessageBox(dialog)
                 msg_box.setWindowTitle("未提取到商品ID")
                 msg_box.setIcon(QMessageBox.Warning)
@@ -5162,143 +5372,65 @@ class FolderDatabaseApp(QMainWindow):
                     failed_text += "\n".join(failed_links)
                 else:
                     failed_text += "\n".join(failed_links[:5]) + f"\n... (还有 {len(failed_links) - 5} 个)"
-                failed_text += "\n\n是否重试？"
+                failed_text += "\n\n请选择操作："
                 
                 msg_box.setText(failed_text)
                 retry_btn = msg_box.addButton("重试", QMessageBox.AcceptRole)
-                cancel_btn = msg_box.addButton("忽略", QMessageBox.RejectRole)
+                delete_btn = msg_box.addButton("删除失败链接", QMessageBox.DestructiveRole)
+                ignore_btn = msg_box.addButton("忽略", QMessageBox.RejectRole)
                 msg_box.exec_()
                 
-                if msg_box.clickedButton() == retry_btn:
-                    wait_dialog = show_waiting_dialog(dialog, f"正在重新提取 {len(failed_links)} 个链接的商品ID，请稍候...")
-                    
-                    # **清空旧线程列表**
-                    self._goods_id_threads = []
-                    
-                    # 为每个失败链接创建线程
-                    for link in failed_links:
-                        retry_thread = GoodsIdThread(link)
-                        
-                        def make_retry_received(link):
-                            def on_retry_received(received_link, goods_id):
-                                print(f"[DEBUG] 重试收到结果: {received_link}, goods_id: {goods_id}")
-                                for item in self.stolen_img_link_data[name]:
-                                    if item["link"] == link:
-                                        item["goods_id"] = goods_id
-                                        break
-                                refresh_links()
-                            return on_retry_received
-                        
-                        retry_thread.result_signal.connect(make_retry_received(link))
-                        
-                        # **先从列表移除，再删除对象**
-                        def make_cleanup(thread):
-                            def cleanup():
-                                try:
-                                    if thread in self._goods_id_threads:
-                                        self._goods_id_threads.remove(thread)
-                                except (ValueError, RuntimeError):
-                                    pass
-                                thread.deleteLater()
-                            return cleanup
-                        
-                        retry_thread.finished.connect(make_cleanup(retry_thread))
-                        self._goods_id_threads.append(retry_thread)
-                        retry_thread.start()
-                    
-                    # 检查所有重试线程完成
-                    def check_retry_threads():
-                        # **安全地检查线程状态**
-                        still_running = []
-                        for t in self._goods_id_threads[:]:
-                            try:
-                                if t.isRunning():
-                                    still_running.append(t)
-                            except RuntimeError:
-                                pass
-                        
-                        print(f"[DEBUG] 重试中，剩余运行线程: {len(still_running)}")
-                        
-                        if not still_running:
-                            self._active_timer.stop()
-                            self._active_timer = None
-                            wait_dialog.close()
-                            
-                            # **延迟执行，避免事件循环阻塞**
-                            QTimer.singleShot(100, finish_and_check_again)
-                    
-                    def finish_and_check_again():
-                        """完成重试后再次检查是否还有失败的链接"""
-                        still_failed = [
-                            item.get("link")
-                            for item in self.stolen_img_link_data[name]
-                            if not item.get("goods_id")
-                        ]
-                        
-                        if still_failed:
-                            # **直接递归调用，复用同一个提示框逻辑**
-                            class TempEvent:
-                                def ignore(self):
-                                    pass
-                                def accept(self):
-                                    pass
-                            
-                            temp_event = TempEvent()
-                            self._goods_id_threads = []
-                            dialog_close_event(temp_event)
-                        else:
-                            # 全部成功
-                            finish_dialog_close()
-                            dialog.close()
-                    
-                    self._active_timer = QTimer()
-                    self._active_timer.timeout.connect(check_retry_threads)
-                    self._active_timer.start(100)
+                clicked_button = msg_box.clickedButton()
+                
+                if clicked_button == retry_btn:
+                    # **调用重试函数**
+                    start_retry(failed_links)
                     event.ignore()
                     return
-                else:
-                    # 用户点击取消
+                
+                elif clicked_button == delete_btn:
+                    # **删除所有失败的链接**
+                    print(f"[DEBUG] 删除失败链接: {failed_links}")
+                    
+                    # 从数据中移除失败的链接
+                    self.stolen_img_link_data[name] = [
+                        item for item in self.stolen_img_link_data[name]
+                        if item.get("link") not in failed_links
+                    ]
+                    
+                    # 刷新界面
+                    refresh_links()
+                    
+                    # 提示用户
+                    QMessageBox.information(
+                        dialog,
+                        "删除完成",
+                        f"已删除 {len(failed_links)} 个未成功提取商品ID的链接"
+                    )
+                    
+                    # **设置关闭标志并执行去重/过滤**
+                    self._is_closing = True
                     finish_dialog_close()
+                    # **不需要调用 dialog.close()，因为 event.accept() 会关闭**
                     event.accept()
+                    self._is_closing = False
+                    return
+                
+                else:
+                    # **用户点击忽略，设置关闭标志并执行去重/过滤**
+                    self._is_closing = True
+                    finish_dialog_close()
+                    # **不需要调用 dialog.close()，因为 event.accept() 会关闭**
+                    event.accept()
+                    self._is_closing = False
                     return
             
             # ---- 没有失败的链接，执行去重/过滤 ----
+            self._is_closing = True
             finish_dialog_close()
+            # **不需要调用 dialog.close()，因为 event.accept() 会关闭**
             event.accept()
-
-        def finish_dialog_close():
-            """完成对话框关闭的后续处理"""
-            print("[DEBUG] 开始执行 finish_dialog_close")
-            
-            # **确保停止所有定时器**
-            if hasattr(self, '_active_timer') and self._active_timer:
-                self._active_timer.stop()
-                self._active_timer = None
-            
-            perform_dedup_filter()
-            refresh_links()
-            
-            msg_parts = []
-            if self._pending_skipped_links:
-                msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
-            if self._pending_filtered_links:
-                msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
-            if msg_parts:
-                QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
-            
-            # 清理剪贴板监听
-            try:
-                clipboard.dataChanged.disconnect(on_clipboard_changed)
-            except Exception:
-                pass
-            
-            self._pending_skipped_links = []
-            self._pending_filtered_links = []
-            
-            # **清理线程列表**
-            self._goods_id_threads = []
-            
-            print("[DEBUG] finish_dialog_close 完成")
+            self._is_closing = False
 
         # 绑定关闭事件
         dialog.closeEvent = dialog_close_event
