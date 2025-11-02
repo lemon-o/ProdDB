@@ -30,7 +30,7 @@ from collections import OrderedDict
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.1.1" #版本号
+CURRENT_VERSION = "v1.1.2" #版本号
 
 BASE_DIR = Path(os.getenv("LOCALAPPDATA")) / "ProdDB"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1500,25 +1500,39 @@ class FolderScanner(QThread):
         if not os.path.exists(fixed_folder):
             return "", ""
 
-        for file in os.listdir(fixed_folder):
-            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                image_path = os.path.join(fixed_folder, file)
-                try:
-                    img = Image.open(image_path).convert("RGBA")
-                    img = img.resize((400, 400), Image.Resampling.LANCZOS)
+        # 搜集所有图片
+        image_files = [file for file in os.listdir(fixed_folder)
+                    if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+        
+        if not image_files:
+            return "", ""
 
-                    # 保存到 folder_path 下（thumbnail_cloud）
-                    img.save(thumbnail_cloud_path, "PNG")
+        # 优先查找文件名为 "CC" 的图片
+        cc_image = None
+        for file in image_files:
+            name_without_ext = os.path.splitext(file)[0]
+            if name_without_ext.lower() == "cc":
+                cc_image = file
+                break
 
-                    # 复制到程序目录的 thumbnail 文件夹
-                    shutil.copy2(thumbnail_cloud_path, thumbnail_path)
+        # 使用 CC 图片，如果没有则使用第一个图片
+        chosen_image = cc_image if cc_image else image_files[0]
+        image_path = os.path.join(fixed_folder, chosen_image)
 
-                    return thumbnail_cloud_path, thumbnail_path
-                except Exception as e:
-                    print(f"生成缩略图失败: {e}")
-                    return "", ""
-        return "", ""
+        try:
+            img = Image.open(image_path).convert("RGBA")
+            img = img.resize((400, 400), Image.Resampling.LANCZOS)
 
+            # 保存到 folder_path 下（thumbnail_cloud）
+            img.save(thumbnail_cloud_path, "PNG")
+
+            # 复制到程序目录的 thumbnail 文件夹
+            shutil.copy2(thumbnail_cloud_path, thumbnail_path)
+
+            return thumbnail_cloud_path, thumbnail_path
+        except Exception as e:
+            print(f"生成缩略图失败: {e}")
+            return "", ""
 
 # ------------------ 可点击 QLabel ------------------
 class ClickableLabel(QLabel):
@@ -1934,24 +1948,39 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         self._init_widget_pool()
         self._setup_scrollbars()
         self._setup_styling()
-        
+
+        self.viewport_height = self.viewport().height()
+        self.viewport_layout = QVBoxLayout(self.viewport())
+        self.viewport_layout.setContentsMargins(0, 0, 0, 0)
+        self.viewport_layout.setSpacing(0)
+            
         # 性能监控
         self.performance_stats = {
             'render_count': 0,
             'cache_hits': 0,
             'cache_misses': 0
         }
-    
+        
     def _init_widget_pool(self):
         """初始化widget对象池"""
+        self.widget_pool.clear()
         for _ in range(self.pool_size):
             widget = VirtualFolderItemWidget()
+            widget.setParent(self.viewport())  # 设置为viewport的子控件
             widget.hide()  # 初始隐藏
+            
             # 连接widget的信号到虚拟列表
             widget.clicked.connect(self._on_widget_clicked)
             widget.double_clicked.connect(self._on_widget_double_clicked)
             widget.right_clicked.connect(self._on_widget_right_clicked)
+            
             self.widget_pool.append(widget)
+
+    def _on_widget_edit_remark(self, folder_data):
+        """转发widget的编辑备注请求到主窗口"""
+        top_window = self.window()  # 获取顶层窗口
+        if hasattr(top_window, "edit_folder_remark"):
+            top_window.edit_folder_remark(folder_data)
 
     # 支持 Home/End/Ctrl+A
     def keyPressEvent(self, event):
@@ -2189,10 +2218,9 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
             self._clear_all_widgets()
             return
 
-        viewport_rect = self.viewport().rect()
         scroll_value = self.verticalScrollBar().value()
+        viewport_rect = self.viewport().rect()
 
-        # 可见范围 + 缓冲
         buffer_size = 3
         start_index = max(0, scroll_value // self.item_height - buffer_size)
         end_index = min(len(self.items_data), (scroll_value + viewport_rect.height()) // self.item_height + buffer_size + 1)
@@ -2204,28 +2232,46 @@ class HighPerformanceVirtualList(QAbstractScrollArea):
         for index in old_visible - current_visible:
             self._return_widget_to_pool(index)
 
-        # 创建新可见widget
-        for index in current_visible - old_visible:
+        # 创建或获取可见widget
+        for index in current_visible:
             if 0 <= index < len(self.items_data):
-                self._create_visible_widget(index)
+                if index not in self.visible_widgets:
+                    widget = self._get_widget_from_pool()
+                    self.visible_widgets[index] = widget
 
-        # 更新位置、状态和缩略图
-        for index, widget in self.visible_widgets.items():
-            y_pos = index * self.item_height - scroll_value
-            widget.setGeometry(0, y_pos, viewport_rect.width(), self.item_height)
-            widget.show()
-            
-            # 更新 widget 数据内容
-            widget.update_data(self.items_data[index], index)
-            
-            widget.set_selected(index in self.selected_indices)
-            widget.set_current(index == self.current_index)
+                    if widget.parent() is None:
+                        widget.setParent(self.viewport())
 
-            # 缩略图缓存立即显示
-            thumbnail_path = self.items_data[index].get("thumbnail", "")
-            if thumbnail_path in self.thumbnail_cache:
-                widget.set_thumbnail(self.thumbnail_cache[thumbnail_path])
-                self.performance_stats['cache_hits'] += 1
+                    if not hasattr(widget, "_add_remark_connected"):
+                        widget.add_remark_requested.connect(self._on_widget_edit_remark)
+                        widget._add_remark_connected = True
+
+                # 更新数据和状态
+                widget = self.visible_widgets[index]
+                data = self.items_data[index]
+                widget.update_data(data, index)
+                widget.set_selected(index in self.selected_indices)
+                widget.set_current(index == self.current_index)
+
+                # 缩略图缓存立即显示
+                thumbnail_path = data.get("thumbnail", "")
+                if thumbnail_path in self.thumbnail_cache:
+                    widget.set_thumbnail(self.thumbnail_cache[thumbnail_path])
+                    self.performance_stats['cache_hits'] += 1
+
+                # **根据 remark 刷新按钮显示**
+                remark = data.get("remark", "").strip()
+                if remark:
+                    widget.add_remark_btn.hide()
+                    widget.remark_label.show()
+                else:
+                    widget.add_remark_btn.show()
+                    widget.remark_label.hide()
+
+                # 手动定位
+                y_pos = index * self.item_height - scroll_value
+                widget.setGeometry(0, y_pos, viewport_rect.width(), self.item_height)
+                widget.show()
 
         # 异步加载未缓存的缩略图
         self._load_visible_thumbnails(start_index, end_index)
@@ -2432,6 +2478,7 @@ class VirtualFolderItemWidget(QWidget):
     clicked = pyqtSignal(object)  # 传递widget自身
     double_clicked = pyqtSignal(object)
     right_clicked = pyqtSignal(object, QPoint)
+    add_remark_requested = pyqtSignal(dict)  # 传递数据字典
     
     def __init__(self):
         super().__init__()
@@ -2448,21 +2495,20 @@ class VirtualFolderItemWidget(QWidget):
         self.setMouseTracking(True)
     
     def _setup_ui(self):
-        """设置UI结构"""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 0, 0)
         layout.setSpacing(5)
         layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
 
-        # 文件夹名称
         self.name_label = QLabel()
-        self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse) # 允许鼠标托选复制
+        self.name_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.name_label.setContentsMargins(15, 5, 5, 5)
         self.name_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.name_label.setFixedWidth(100)
         layout.addWidget(self.name_label)
+        # 安装事件过滤器
+        self.name_label.installEventFilter(self)
 
-        # 缩略图容器
         self.icon_label = QLabel()
         self.icon_label.setFixedSize(70, 70)
         self.icon_label.setStyleSheet("border:1px solid #ccc; background-color: #f8f9fa;")
@@ -2470,22 +2516,40 @@ class VirtualFolderItemWidget(QWidget):
         self._set_default_icon()
         layout.addWidget(self.icon_label)
 
-        # 备注信息区域
-        info_layout = QVBoxLayout()
-        info_layout.setContentsMargins(30, 5, 20, 5)
-        info_layout.setSpacing(5)
-        info_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        
+        self.info_layout = QVBoxLayout()
+        self.info_layout.setContentsMargins(30, 5, 20, 5)
+        self.info_layout.setSpacing(5)
+        self.info_layout.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+
         self.remark_label = QLabel()
-        self.remark_label.setTextInteractionFlags(Qt.TextSelectableByMouse) # 允许鼠标托选复制
+        self.remark_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.remark_label.setWordWrap(True)
-        info_layout.addWidget(self.remark_label)
+        self.info_layout.addWidget(self.remark_label)
+        self.remark_label.installEventFilter(self)  # 安装事件过滤器，用于双击
+
+        self.add_remark_btn = QPushButton("新增备注")
+        self.add_remark_btn.hide()
+        self.add_remark_btn.clicked.connect(self._on_add_remark_clicked)
+        self.info_layout.addWidget(self.add_remark_btn)
 
         layout.addStretch(1)
-        layout.addLayout(info_layout)
-        
-        # 设置默认样式
+        layout.addLayout(self.info_layout)
         self._update_style()
+
+    def eventFilter(self, obj, event):
+        if obj == self.name_label and event.type() == QEvent.Type.MouseButtonRelease:
+            # 单击时复制文本到剪贴板
+            text = self.name_label.text()
+            QApplication.clipboard().setText(text)
+            self.tip_manager = FloatingTipManager(self)
+            self.tip_manager.show_tip("复制成功", duration_ms=1500)
+
+        if obj == self.remark_label and event.type() == QEvent.MouseButtonDblClick:
+            if self._data:
+                self.add_remark_requested.emit(self._data.copy())
+
+            return True  # 阻止事件继续传播
+        return super().eventFilter(obj, event)
     
     def _set_default_icon(self):
         """设置默认文件夹图标"""
@@ -2504,36 +2568,46 @@ class VirtualFolderItemWidget(QWidget):
         """更新widget数据"""
         self._data = data
         self._index = index
-        
-        # 更新显示内容
+
         name = data.get("name", "未知文件夹")
         remark = data.get("remark", "")
         path = data.get("path", "")
-        
+
         self.name_label.setText(name)
         self.remark_label.setText(remark)
-        
-        # 设置tooltip
+
+        # 逻辑：如果备注为空则显示“新增备注”按钮
+        if not remark.strip():
+            self.add_remark_btn.show()
+            self.remark_label.hide()
+        else:
+            self.add_remark_btn.hide()
+            self.remark_label.show()
+
         tooltip = f"路径: {path}"
         if remark:
             tooltip += f"\n备注: {remark}"
         self.setToolTip(tooltip)
-        
-        # 重置为默认图标，缩略图将异步加载
         self._set_default_icon()
-    
+
     def clear_data(self):
-        """清理数据时也要重置hover状态"""
         self._data = {}
         self._index = -1
         self._selected = False
         self._current = False
-        self._hovered = False  # 重置hover状态
+        self._hovered = False
         self.name_label.setText("")
         self.remark_label.setText("")
         self.setToolTip("")
         self._set_default_icon()
+        self.add_remark_btn.hide()
+        self.remark_label.show()
         self._update_style()
+
+    def _on_add_remark_clicked(self):
+        """点击“新增备注”"""
+        if self._data:
+            self.add_remark_requested.emit(self._data.copy())
     
     def set_thumbnail(self, pixmap):
         """设置缩略图"""
@@ -2663,6 +2737,77 @@ class VirtualFolderItemWidget(QWidget):
         if not self._hovered:
             self.set_hovered(True)
         super().mouseMoveEvent(event)
+
+# -------------------- 子线程 显示提示 --------------------
+from PyQt5.QtWidgets import QDialog, QWidget, QVBoxLayout, QLabel
+from PyQt5.QtCore import Qt, QTimer, QCoreApplication, QMetaObject, Qt
+from PyQt5.QtGui import QFont
+
+class FloatingTipManager:
+    def __init__(self, parent_window):
+        self.parent = parent_window
+        self.current_tip = None
+
+    def show_tip(self, text: str, duration_ms: int = 1500):
+        """显示浮动提示"""
+        # 确保在主线程执行
+        if QCoreApplication.instance().thread() != self.parent.thread():
+            QMetaObject.invokeMethod(
+                self.parent,
+                lambda: self._show_tip_impl(text, duration_ms),
+                Qt.QueuedConnection
+            )
+        else:
+            self._show_tip_impl(text, duration_ms)
+
+    def _show_tip_impl(self, text: str, duration_ms: int):
+        # 先关闭已有提示
+        if self.current_tip is not None:
+            self.current_tip.close()
+            self.current_tip = None
+
+        # 创建 dialog
+        tip_dialog = QDialog(self.parent)
+        tip_dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        tip_dialog.setAttribute(Qt.WA_TranslucentBackground)
+        tip_dialog.setModal(False)
+
+        # 主容器
+        main_widget = QWidget(tip_dialog)
+        main_widget.setStyleSheet("""
+            background-color: rgba(0, 0, 0, 0.7);
+            border-radius: 8px;
+        """)
+        layout = QVBoxLayout(main_widget)
+        layout.setContentsMargins(15, 8, 15, 8)
+
+        # 标签
+        label = QLabel(text)
+        label.setStyleSheet("""
+            color: white;
+            background: transparent;
+        """)
+
+        label.setAlignment(Qt.AlignCenter)
+        label.setFont(QFont("Arial", 12))
+        layout.addWidget(label)
+
+        tip_dialog.resize(main_widget.sizeHint())
+        tip_dialog.show()
+        tip_dialog.adjustSize()  # 确保尺寸正确
+
+        # 居中父窗口
+        parent_pos = self.parent.mapToGlobal(self.parent.rect().topLeft())
+        tip_dialog.move(
+            parent_pos.x() + (self.parent.width() - tip_dialog.width()) // 2,
+            parent_pos.y() + (self.parent.height() - tip_dialog.height()) // 2
+        )
+
+        self.current_tip = tip_dialog
+
+        # 自动关闭
+        QTimer.singleShot(duration_ms, lambda: tip_dialog.close())
+
 
 # -------------------- 子线程 加载数据库 --------------------
 class LoadFoldersThread(QThread):
@@ -4670,25 +4815,60 @@ class FolderDatabaseApp(QMainWindow):
                         QMessageBox.warning(extract_dialog, "错误", "请输入链接")
                         return
 
-                    # 启动线程获取 goods_id
+                    # 显示等待提示框（带父窗口）
+                    wait_dialog = show_waiting_dialog(extract_dialog, "正在提取商品ID，请稍候...")
+
+                    # 启动提取线程
                     thread = GoodsIdThread(link)
 
-                    # 提取完成后更新过滤框 text_edit
                     def on_goods_id_received(link, goods_id):
                         if not goods_id:
-                            QMessageBox.warning(dialog_filter, "提示", f"未提取到 goods_id: {link}")
+                            # 弹出包含“重试”的提示框
+                            msg_box = QMessageBox(dialog_filter)
+                            msg_box.setWindowTitle("提示")
+                            msg_box.setText(f"未提取到 goods_id: {link}")
+                            msg_box.setIcon(QMessageBox.Warning)
+                            msg_box.addButton("重试", QMessageBox.AcceptRole)
+                            msg_box.addButton("忽略", QMessageBox.RejectRole)
+                            result = msg_box.exec_()
+
+                            if result == QMessageBox.AcceptRole:
+                                # 点击“重试” → 再次显示等待提示框
+                                retry_wait = show_waiting_dialog(dialog_filter, "正在重新提取商品ID，请稍候...")
+
+                                # 创建新的线程重新获取 goods_id
+                                retry_thread = GoodsIdThread(link)
+
+                                def on_retry_received(link, goods_id):
+                                    # 关闭等待提示框
+                                    if retry_wait and retry_wait.isVisible():
+                                        retry_wait.close()
+                                    # 重新执行相同逻辑（递归调用自身）
+                                    on_goods_id_received(link, goods_id)
+
+                                def on_retry_finished():
+                                    if retry_wait and retry_wait.isVisible():
+                                        retry_wait.close()
+
+                                retry_thread.result_signal.connect(on_retry_received)
+                                retry_thread.finished.connect(on_retry_finished)
+                                retry_thread.finished.connect(
+                                    lambda t=retry_thread: self._goods_id_threads.remove(t)
+                                    if t in self._goods_id_threads else None
+                                )
+                                self._goods_id_threads.append(retry_thread)
+                                retry_thread.start()
+
                             return
 
-                        # 确保 goods_id 是列表
+                        # ---- 以下是提取成功时的逻辑 ----
                         if isinstance(goods_id, str):
                             goods_id = [goods_id]
                         elif not isinstance(goods_id, (list, tuple)):
                             goods_id = list(goods_id)
 
-                        # 获取现有的文本内容
                         existing_ids = set(line.strip() for line in text_edit.toPlainText().splitlines() if line.strip())
 
-                        # 分离重复和新增 ID
                         new_ids = []
                         skipped_ids = []
                         for gid in goods_id:
@@ -4697,21 +4877,26 @@ class FolderDatabaseApp(QMainWindow):
                             else:
                                 new_ids.append(gid)
 
-                        # 更新过滤框，只添加新增 ID
                         if new_ids:
                             updated_ids = existing_ids.union(new_ids)
                             text_edit.setText("\n".join(sorted(updated_ids)))
 
-                        # 提示被跳过的重复 ID
                         if skipped_ids:
                             QMessageBox.information(dialog_filter, "提示", f"以下 ID 已存在，已跳过:\n" + "\n".join(skipped_ids))
 
+                    def on_thread_finished():
+                        # 线程完成后关闭等待提示框和提取窗口
+                        if wait_dialog and wait_dialog.isVisible():
+                            wait_dialog.close()
+                        extract_dialog.accept()
+
+                    # 连接信号
                     thread.result_signal.connect(on_goods_id_received)
+                    thread.finished.connect(on_thread_finished)
                     thread.finished.connect(lambda t=thread: self._goods_id_threads.remove(t) if t in self._goods_id_threads else None)
+
                     self._goods_id_threads.append(thread)
                     thread.start()
-
-                    extract_dialog.accept()
 
                 btn_paste.clicked.connect(on_paste)
                 btn_extract.clicked.connect(on_extract)
@@ -4846,13 +5031,17 @@ class FolderDatabaseApp(QMainWindow):
             self._pending_skipped_links = pending_skipped
             self._pending_filtered_links = pending_filtered
 
-
         # 创建无按钮的等待提示框
         waiting_dialog = None
 
-        def show_waiting_dialog():
-            nonlocal waiting_dialog
-            waiting_dialog = QDialog(dialog)
+        def show_waiting_dialog(parent, text="请稍候..."):
+            """
+            创建一个无按钮、半透明等待提示框。
+            parent: 父窗口
+            text: 显示的提示文字
+            返回 QDialog 实例
+            """
+            waiting_dialog = QDialog(parent)
             waiting_dialog.setModal(True)
             
             # 去除标题栏和边框
@@ -4866,7 +5055,7 @@ class FolderDatabaseApp(QMainWindow):
                 #mainWidget {
                     background-color: rgba(0, 0, 0, 0.7);
                     border-radius: 8px;
-                    padding: 0px;
+                    padding: 10px;
                 }
             """)
             
@@ -4878,7 +5067,7 @@ class FolderDatabaseApp(QMainWindow):
             content_layout = QVBoxLayout(main_widget)
             
             # 提示文字
-            label = QLabel("正在提取商品ID，请稍候...")
+            label = QLabel(text)
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet("""
                 QLabel {
@@ -4892,6 +5081,8 @@ class FolderDatabaseApp(QMainWindow):
             content_layout.addWidget(label)
             
             waiting_dialog.show()
+            QApplication.processEvents()  # 确保立即显示
+            return waiting_dialog
 
         def close_waiting_dialog_and_finish():
             nonlocal waiting_dialog
@@ -4929,28 +5120,164 @@ class FolderDatabaseApp(QMainWindow):
 
         # 关闭对话框事件
         def dialog_close_event(event):
+            # **添加：停止所有可能存在的旧定时器**
+            if hasattr(self, '_active_timer') and self._active_timer:
+                self._active_timer.stop()
+                self._active_timer = None
+            
+            # 收集仍在运行的线程
             active_threads = [t for t in self._goods_id_threads if t.isRunning()]
             if active_threads:
-                # 显示无按钮等待框
-                show_waiting_dialog()
+                wait_dialog = show_waiting_dialog(dialog, "正在提取商品ID，请稍候...")
                 
-                # 监听所有线程完成
-                def check_threads_finished_for_close():
+                def check_threads():
                     if all(not t.isRunning() for t in self._goods_id_threads):
-                        timer.stop()
+                        self._active_timer.stop()
+                        self._active_timer = None
+                        wait_dialog.close()
                         close_waiting_dialog_and_finish()
                 
-                timer = QTimer()
-                timer.timeout.connect(check_threads_finished_for_close)
-                timer.start(100)  # 每100ms检查一次
-                
-                event.ignore()  # 阻止对话框关闭
+                self._active_timer = QTimer()
+                self._active_timer.timeout.connect(check_threads)
+                self._active_timer.start(100)
+                event.ignore()
                 return
+            
+            # ---- 所有线程完成，开始处理失败的 goods_id ----
+            failed_links = [
+                item.get("link")
+                for item in self.stolen_img_link_data[name]
+                if not item.get("goods_id")
+            ]
+            
+            if failed_links:
+                # **合并后的提示框：显示失败链接并询问是否重试**
+                msg_box = QMessageBox(dialog)
+                msg_box.setWindowTitle("未提取到商品ID")
+                msg_box.setIcon(QMessageBox.Warning)
+                
+                # 显示失败链接列表
+                failed_text = f"以下 {len(failed_links)} 个链接未成功提取商品ID：\n"
+                if len(failed_links) <= 5:
+                    failed_text += "\n".join(failed_links)
+                else:
+                    failed_text += "\n".join(failed_links[:5]) + f"\n... (还有 {len(failed_links) - 5} 个)"
+                failed_text += "\n\n是否重试？"
+                
+                msg_box.setText(failed_text)
+                retry_btn = msg_box.addButton("重试", QMessageBox.AcceptRole)
+                cancel_btn = msg_box.addButton("忽略", QMessageBox.RejectRole)
+                msg_box.exec_()
+                
+                if msg_box.clickedButton() == retry_btn:
+                    wait_dialog = show_waiting_dialog(dialog, f"正在重新提取 {len(failed_links)} 个链接的商品ID，请稍候...")
+                    
+                    # **清空旧线程列表**
+                    self._goods_id_threads = []
+                    
+                    # 为每个失败链接创建线程
+                    for link in failed_links:
+                        retry_thread = GoodsIdThread(link)
+                        
+                        def make_retry_received(link):
+                            def on_retry_received(received_link, goods_id):
+                                print(f"[DEBUG] 重试收到结果: {received_link}, goods_id: {goods_id}")
+                                for item in self.stolen_img_link_data[name]:
+                                    if item["link"] == link:
+                                        item["goods_id"] = goods_id
+                                        break
+                                refresh_links()
+                            return on_retry_received
+                        
+                        retry_thread.result_signal.connect(make_retry_received(link))
+                        
+                        # **先从列表移除，再删除对象**
+                        def make_cleanup(thread):
+                            def cleanup():
+                                try:
+                                    if thread in self._goods_id_threads:
+                                        self._goods_id_threads.remove(thread)
+                                except (ValueError, RuntimeError):
+                                    pass
+                                thread.deleteLater()
+                            return cleanup
+                        
+                        retry_thread.finished.connect(make_cleanup(retry_thread))
+                        self._goods_id_threads.append(retry_thread)
+                        retry_thread.start()
+                    
+                    # 检查所有重试线程完成
+                    def check_retry_threads():
+                        # **安全地检查线程状态**
+                        still_running = []
+                        for t in self._goods_id_threads[:]:
+                            try:
+                                if t.isRunning():
+                                    still_running.append(t)
+                            except RuntimeError:
+                                pass
+                        
+                        print(f"[DEBUG] 重试中，剩余运行线程: {len(still_running)}")
+                        
+                        if not still_running:
+                            self._active_timer.stop()
+                            self._active_timer = None
+                            wait_dialog.close()
+                            
+                            # **延迟执行，避免事件循环阻塞**
+                            QTimer.singleShot(100, finish_and_check_again)
+                    
+                    def finish_and_check_again():
+                        """完成重试后再次检查是否还有失败的链接"""
+                        still_failed = [
+                            item.get("link")
+                            for item in self.stolen_img_link_data[name]
+                            if not item.get("goods_id")
+                        ]
+                        
+                        if still_failed:
+                            # **直接递归调用，复用同一个提示框逻辑**
+                            class TempEvent:
+                                def ignore(self):
+                                    pass
+                                def accept(self):
+                                    pass
+                            
+                            temp_event = TempEvent()
+                            self._goods_id_threads = []
+                            dialog_close_event(temp_event)
+                        else:
+                            # 全部成功
+                            finish_dialog_close()
+                            dialog.close()
+                    
+                    self._active_timer = QTimer()
+                    self._active_timer.timeout.connect(check_retry_threads)
+                    self._active_timer.start(100)
+                    event.ignore()
+                    return
+                else:
+                    # 用户点击取消
+                    finish_dialog_close()
+                    event.accept()
+                    return
+            
+            # ---- 没有失败的链接，执行去重/过滤 ----
+            finish_dialog_close()
+            event.accept()
 
-            # 没有活动线程，直接执行去重/过滤
+        def finish_dialog_close():
+            """完成对话框关闭的后续处理"""
+            print("[DEBUG] 开始执行 finish_dialog_close")
+            
+            # **确保停止所有定时器**
+            if hasattr(self, '_active_timer') and self._active_timer:
+                self._active_timer.stop()
+                self._active_timer = None
+            
             perform_dedup_filter()
             refresh_links()
-
+            
             msg_parts = []
             if self._pending_skipped_links:
                 msg_parts.append(f"共去除 {len(self._pending_skipped_links)} 个重复链接")
@@ -4958,17 +5285,20 @@ class FolderDatabaseApp(QMainWindow):
                 msg_parts.append(f"共去除 {len(self._pending_filtered_links)} 个被过滤的链接")
             if msg_parts:
                 QMessageBox.information(dialog, "去重/过滤提示", "\n\n".join(msg_parts))
-
+            
             # 清理剪贴板监听
             try:
                 clipboard.dataChanged.disconnect(on_clipboard_changed)
             except Exception:
                 pass
-
+            
             self._pending_skipped_links = []
             self._pending_filtered_links = []
-
-            event.accept()
+            
+            # **清理线程列表**
+            self._goods_id_threads = []
+            
+            print("[DEBUG] finish_dialog_close 完成")
 
         # 绑定关闭事件
         dialog.closeEvent = dialog_close_event
@@ -4990,28 +5320,100 @@ class FolderDatabaseApp(QMainWindow):
         """编辑文件夹备注"""
         folder_name = folder_data.get("name", "未知文件夹")
         folder_path = folder_data.get("path", "")
-        
-        # 获取当前备注
+        thumbnail_path = folder_data.get("thumbnail", "")
         current_remark = folder_data.get("remark", "")
-        
-        # 创建备注编辑对话框
+
         dialog = FixedPositionDialog(parent=self, offset=QPoint(0, 0))
         dialog.setWindowTitle("编辑备注")
-        dialog.setFixedSize(400, 300)
+        dialog.setFixedSize(600, 300)
         dialog.setWindowModality(Qt.WindowModal)
 
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        main_layout = QHBoxLayout(dialog)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(10)
 
-        info_label = QLabel(f"文件夹：{folder_name}")
-        info_label.setStyleSheet("font-weight: bold; margin: 0; padding: 0;")
-        layout.addWidget(info_label)
+        # 左侧缩略图容器
+        thumb_container = QFrame()
+        thumb_container.setStyleSheet("""
+            QFrame {
+                border: 2px solid #e9ecef;
+                border-radius: 6px;
+                background-color: white;
+            }
+        """)
+        thumb_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        container_layout = QVBoxLayout(thumb_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        thumb_label = QLabel()
+        thumb_label.setAlignment(Qt.AlignCenter)
+        thumb_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        thumb_label.setStyleSheet("background: transparent; border: none;")
+
+        if os.path.exists(thumbnail_path):
+            pixmap = QPixmap(thumbnail_path)
+            thumb_label.original_pixmap = pixmap
+            
+            # 创建圆角图片的函数
+            def create_rounded_pixmap(pixmap, size, radius=3):
+                # 缩放图片
+                scaled = pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                
+                # 创建圆角遮罩
+                rounded = QPixmap(scaled.size())
+                rounded.fill(Qt.transparent)
+                
+                painter = QPainter(rounded)
+                painter.setRenderHint(QPainter.Antialiasing)
+                
+                path = QPainterPath()
+                path.addRoundedRect(0, 0, scaled.width(), scaled.height(), radius, radius)
+                painter.setClipPath(path)
+                painter.drawPixmap(0, 0, scaled)
+                painter.end()
+                
+                return rounded
+            
+            thumb_label.setPixmap(create_rounded_pixmap(pixmap, thumb_label.size()))
+        else:
+            thumb_label.setText("无缩略图")
+            thumb_label.setStyleSheet("color: #999; background: transparent; border: none;")
+            thumb_label.original_pixmap = None
+
+        # 缩略图随大小调整
+        def resize_thumb(event):
+            if getattr(thumb_label, "original_pixmap", None):
+                def create_rounded_pixmap(pixmap, size, radius=3):
+                    scaled = pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    rounded = QPixmap(scaled.size())
+                    rounded.fill(Qt.transparent)
+                    
+                    painter = QPainter(rounded)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    
+                    path = QPainterPath()
+                    path.addRoundedRect(0, 0, scaled.width(), scaled.height(), radius, radius)
+                    painter.setClipPath(path)
+                    painter.drawPixmap(0, 0, scaled)
+                    painter.end()
+                    
+                    return rounded
+                
+                thumb_label.setPixmap(create_rounded_pixmap(thumb_label.original_pixmap, thumb_label.size()))
+
+        thumb_label.resizeEvent = resize_thumb
+
+        container_layout.addWidget(thumb_label)
+        main_layout.addWidget(thumb_container, 1)
+
+        # 右侧备注编辑 + 按钮
+        right_layout = QVBoxLayout()
         remark_text = QTextEdit()
         remark_text.setPlainText(current_remark)
         remark_text.setPlaceholderText("请输入备注信息...")
-        layout.addWidget(remark_text)
+        right_layout.addWidget(remark_text)
 
         button_layout = QHBoxLayout()
         ok_button = QPushButton("确定")
@@ -5020,17 +5422,18 @@ class FolderDatabaseApp(QMainWindow):
         cancel_button.clicked.connect(dialog.reject)
         button_layout.addWidget(ok_button)
         button_layout.addWidget(cancel_button)
-        layout.addLayout(button_layout)
+        right_layout.addLayout(button_layout)
+
+        main_layout.addLayout(right_layout, 1)
 
         remark_text.setFocus()
 
         if dialog.exec_() == QDialog.Accepted:
             new_remark = remark_text.toPlainText().strip()
-            folder_data["remark"] = new_remark  # 更新数据字典
-            # 更新修改日期（自动使用当前时间）
+            folder_data["remark"] = new_remark
             self.update_folder_field_value(folder_data, "modify_date")
 
-            # 更新虚拟列表中对应 widget
+            # 更新虚拟列表 widget
             for index, data in enumerate(self.folder_list.items_data):
                 if data == folder_data:
                     widget = self.folder_list.visible_widgets.get(index)
@@ -5038,14 +5441,12 @@ class FolderDatabaseApp(QMainWindow):
                         widget.remark_label.setText(new_remark)
                     break
 
-            # 保存备注到【已修】子文件夹
+            # 保存 JSON
             try:
                 fixed_folder_path = os.path.join(folder_path, "已修")
                 os.makedirs(fixed_folder_path, exist_ok=True)
                 safe_name = "".join(c for c in folder_name if c not in "\\/:*?\"<>|")
                 json_file_path = os.path.join(fixed_folder_path, f"{safe_name}_产品信息.json")
-                
-                # 保存 JSON，新增 name 字段
                 with open(json_file_path, "w", encoding="utf-8") as f:
                     json.dump({
                         "name": folder_name,
@@ -5055,6 +5456,7 @@ class FolderDatabaseApp(QMainWindow):
                 self.save_database()
             except Exception as e:
                 QMessageBox.warning(self, "保存失败", f"无法保存产品信息文件：{e}")
+
 
     #更换缩略图
     def change_thumbnail(self, folder_data):
@@ -5763,6 +6165,9 @@ class FolderDatabaseApp(QMainWindow):
 
     #保存数据库
     def save_database(self):
+        #先刷新列表
+        self.folder_list._update_visible_items()
+
         """保存数据库到JSON文件，并更新列表项ToolTip"""
         try:
             for index, folder_data in enumerate(self.folders_data):
