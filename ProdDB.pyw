@@ -30,7 +30,7 @@ from collections import OrderedDict
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # 避免损坏图片报错
 
-CURRENT_VERSION = "v1.1.2" #版本号
+CURRENT_VERSION = "v1.1.3" #版本号
 
 BASE_DIR = Path(os.getenv("LOCALAPPDATA")) / "ProdDB"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -6026,18 +6026,33 @@ class FolderDatabaseApp(QMainWindow):
     def add_folder_realtime(self, folder):
         """单条数据实时添加到虚拟列表（最新添加在最上面）"""
         path = folder.get("path", "")
+        name = folder.get("name", "")
         if not path or path in self.added_folder_paths:
             return
 
-        # 添加到数据源开头
+        # 检查是否存在同名文件夹，若存在则只更新指定字段
+        for existing in self.folders_data:
+            if existing.get("name") == name:
+                existing["path"] = folder["path"]
+                existing["thumbnail"] = folder["thumbnail"]
+                existing["thumbnail_cloud"] = folder["thumbnail_cloud"]
+                self.added_folder_paths.add(path)
+                # 刷新虚拟列表
+                self.folder_list.set_data(self.folders_data[:])
+                QApplication.processEvents()
+                return  # 更新完毕，不再新增
+
+        # 无同名项，正常新增到开头
         self.folders_data.insert(0, folder)
         self.added_folder_paths.add(path)
 
         # 刷新虚拟列表
-        self.folder_list.set_data(self.folders_data[:])  # 传副本，避免引用问题
-        QApplication.processEvents()  # 强制刷新界面
+        self.folder_list.set_data(self.folders_data[:])
+        QApplication.processEvents()
 
     def scan_completed(self, found_count, skipped_count):
+        # 用最新数据重建路径缓存，避免移动后路径过期
+        self.added_folder_paths = {f['path'] for f in self.folders_data}
         self.sort_folders() #应用排序
         # 恢复按钮状态
         self.add_button.setEnabled(True)  # 重新启用按钮
